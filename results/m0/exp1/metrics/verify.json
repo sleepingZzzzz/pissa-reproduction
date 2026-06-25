@@ -1,0 +1,39 @@
+{
+  "experiment": "M0/verify_init",
+  "timestamp": "2026-06-25T21:32:36",
+  "config": {
+    "in_features": 1024,
+    "out_features": 1024,
+    "r": 64,
+    "niter": null,
+    "skip_peft": false,
+    "seed": 0
+  },
+  "results": {
+    "reconstruction_and_forward": {
+      "reconstruction_rel_err": 1.3548552502129496e-08,
+      "forward_rel_err": 3.869234603826044e-07,
+      "tol": 1e-05,
+      "passed": true
+    },
+    "svd_property_eckart_young": {
+      "frobenius_lhs": 909.64404296875,
+      "frobenius_rhs": 909.6550903320312,
+      "frobenius_rel_err": 1.2144562701471418e-05,
+      "frobenius_tol": 0.001,
+      "spectral_lhs": 55.02677536010742,
+      "spectral_rhs": 55.026817321777344,
+      "spectral_rel_err": 7.625676345498598e-07,
+      "spectral_tol": 0.0001,
+      "passed": true
+    },
+    "peft_alignment": {
+      "skipped": false,
+      "reference_layer": "model.layers.0.self_attn.q_proj",
+      "peft_BA_rel_err": 0.0,
+      "peft_res_rel_err": 0.0,
+      "passed": true
+    }
+  },
+  "all_pass": true
+}

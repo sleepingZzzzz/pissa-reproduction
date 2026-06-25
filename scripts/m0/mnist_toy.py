@@ -12,7 +12,9 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -25,6 +27,7 @@ from pissa import PiSSALinear  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUT_DIR = REPO_ROOT / "results" / "m0" / "exp1" / "figures"
+METRICS_DIR = REPO_ROOT / "results" / "m0" / "exp1" / "metrics"
 DATA_DIR = REPO_ROOT / "data" / "mnist"
 
 
@@ -176,6 +179,30 @@ def main() -> None:
     print(f"已保存：{out_path}")
     for method, losses in curves.items():
         print(f"  {method:5s} 末步 loss = {losses[-1]:.4f}")
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_path = METRICS_DIR / "mnist.json"
+    payload = {
+        "experiment": "M0/mnist_toy (Fig.2a)",
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "config": {
+            "epochs": args.epochs,
+            "ft_steps": args.ft_steps,
+            "r": args.r,
+            "lr": args.lr,
+            "batch": args.batch,
+            "device": device,
+            "figure": str(out_path),
+        },
+        "results": {
+            "loss_curves": curves,
+            "final_loss": {m: losses[-1] for m, losses in curves.items()},
+        },
+    }
+    metrics_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    print(f"已保存 metrics：{metrics_path}")
 
 
 if __name__ == "__main__":
