@@ -1,0 +1,39 @@
+# PiSSA 复现公共超参（对齐论文 §5 Experiments）。
+# 各里程碑的 config 通过覆盖此文件的字段来定义具体实验。
+
+# ---- PiSSA / LoRA 适配器 ----
+adapter:
+  r: 128                 # 适配器秩（论文常用 16/64/128）
+  alpha: 128             # 论文设 lora_alpha == r，使 scaling = 1
+  dropout: 0.0           # 论文 lora_dropout = 0
+  target_modules:        # 注入到所有线性层
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  niter: null            # null=精确 SVD；设整数则用 Fast SVD（论文 Appendix B）
+
+# ---- 优化器 / 调度（Alpaca 风格）----
+optim:
+  name: adamw
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  batch_size: 128        # 全局 batch（用梯度累积凑到该值）
+
+# ---- 训练 ----
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true   # 仅对回答部分计算 loss（QLoRA §B.3）
+  dtype: float32                # 论文：LoRA/PiSSA 的 base 与 adapter 均用 fp32
+
+# ---- 精度（量化实验在 M3 覆盖）----
+quant:
+  enable: false
+  bits: 4
+  quant_type: nf4

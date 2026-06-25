@@ -1,0 +1,32 @@
+# ---- 大文件：只在服务器数据盘，不进 Git ----
+data/
+checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.gguf
+
+# ---- 训练产物中的大件（图与指标小文件保留追踪）----
+results/**/logs/
+results/**/*.ckpt
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# ---- 个人记录与感想（不上库）----
+.log/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 实验追踪 ----
+wandb/
