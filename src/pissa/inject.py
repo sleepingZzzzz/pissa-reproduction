@@ -6,6 +6,12 @@ import torch.nn as nn
 
 from .layer import PiSSALinear
 
+try:  # 进度条为可选依赖，缺失时退化为直通迭代器。
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(it, **kwargs):
+        return it
+
 # Llama / Qwen / Gemma 等主流 dense 解码器的全部线性层（注意力 + MLP）。
 DEFAULT_TARGET_MODULES = (
     "q_proj",
@@ -41,7 +47,7 @@ def inject_pissa(
         for name, module in model.named_modules()
         if isinstance(module, nn.Linear) and _match(name, target_modules)
     ]
-    for name, module in to_replace:
+    for name, module in tqdm(to_replace, desc="PiSSA SVD 初始化", unit="layer"):
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         child_name = name.rsplit(".", 1)[-1]
         pissa_layer = PiSSALinear.from_linear(module, r=r, alpha=alpha, niter=niter)
@@ -59,7 +65,7 @@ def merge_pissa(model: nn.Module) -> list[str]:
         for name, module in model.named_modules()
         if isinstance(module, PiSSALinear)
     ]
-    for name, module in to_merge:
+    for name, module in tqdm(to_merge, desc="合并 PiSSA", unit="layer"):
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         child_name = name.rsplit(".", 1)[-1]
         linear = module.to_linear().to(module.lora_A.device, module.lora_A.dtype)

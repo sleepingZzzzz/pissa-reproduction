@@ -36,7 +36,15 @@ data/ checkpoints/  Large files, server-only, git-ignored
 pip install -r requirements.txt
 ```
 
-> On the AutoDL server the image already ships a matching `torch` (CUDA build). Do **not** reinstall torch; only add the remaining packages (`numpy matplotlib pyyaml transformers peft`).
+> On the AutoDL server the image already ships a matching `torch` (`2.8.0+cu128`, CUDA build). Do **not** reinstall torch — `pip` may silently replace it with a CPU-only or mismatched build. Install the other packages only, then verify torch is unchanged:
+>
+> ```bash
+> source /etc/network_turbo          # AutoDL download accelerator (optional)
+> pip install transformers peft datasets accelerate sentencepiece protobuf modelscope addict simplejson sortedcontainers bitsandbytes
+> python -c "import torch;print(torch.__version__)"   # must still print 2.8.0+cu128
+> ```
+>
+> The environment can be configured in CPU-only ("no-GPU") mode; a GPU is only needed at training time.
 
 ## Running M0
 
@@ -54,6 +62,28 @@ python scripts/m0/mnist_toy.py --epochs 3 --ft-steps 300
 Artifacts are saved to `results/m0/exp1/` (`figures/*.png` and `metrics/*.json`).
 
 **M0 result**: our from-scratch PiSSA matches HF PEFT element-wise (zero relative error), satisfies the SVD/reconstruction properties, and reproduces PiSSA's faster-than-LoRA convergence on the toy task — implementation verified.
+
+## Running M1
+
+LLaMA-2-7B on MetaMathQA, evaluated on GSM8K. Config: `configs/m1_llama2_7b.yaml` (rank `r=128`, paper-aligned). Methods: our **PiSSA** / **LoRA** / **Full-FT**.
+
+```bash
+# 0. Prepare data (downloads MetaMathQA + GSM8K via ModelScope, writes local jsonl)
+python scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml          # add --limit 2000 for a smoke run
+
+# 1. Train each method (saves merged model to checkpoints/m1/<method>)
+python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method pissa  # add --limit 64 for a smoke run
+python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method lora
+python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method full
+
+# 2. Evaluate on GSM8K
+python scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method pissa
+
+# 3. Plot loss curves + accuracy bars
+python scripts/m1/plot_curves.py --config configs/m1_llama2_7b.yaml
+```
+
+Memory strategy on a single 96GB GPU: PiSSA/LoRA train in fp32 (frozen base + tiny adapter) with gradient checkpointing on — fp32 activations are large, so disabling it OOMs even on 96GB; Full-FT cannot fit 7B in fp32 (params + AdamW state + grads ≈ 112GB), so it uses bf16 + 8-bit AdamW + gradient checkpointing (`methods.full` in the config). TF32 matmul is enabled in `train.py` to speed up the fp32 paths with negligible numerical impact (this is the main speed lever; it saves no memory). The smoke path (small `--limit`) is meant to be run first to validate the pipeline before launching the long runs.
 
 ## Model Selection
 

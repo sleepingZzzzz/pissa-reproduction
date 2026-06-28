@@ -1,0 +1,98 @@
+# M1：LLaMA-2-7B 在 MetaMathQA 上微调，GSM8K 评测。
+# 目标：用与论文一致的模型，对比 我们的 PiSSA / LoRA / Full-FT，验证复现成功性。
+# 本文件自包含（不依赖 base.yaml 合并），便于一份配置一次实验、避免漂移。
+
+experiment: m1_llama2_7b
+
+# ---- 模型 ----
+model:
+  name: Llama-2-7b
+  # 下载源：modelscope（免申请、国内快） 或 hf（gated，需授权）。
+  source: modelscope
+  ms_repo: modelscope/Llama-2-7b-ms   # ModelScope 上的 LLaMA-2-7B（非 chat 版基座）
+  hf_repo: meta-llama/Llama-2-7b-hf   # HuggingFace 原始（gated）
+  cache_dir: data/m1/models
+
+# ---- 数据 ----
+data:
+  source: modelscope                  # modelscope 或 hf
+  # 训练集：MetaMathQA
+  metamath_ms_repo: AI-ModelScope/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  # 评测集：GSM8K（test，1319 题）
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  # 处理后落地的本地 jsonl（prepare_data.py 生成，train/eval 只读它）
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  # 训练样本数：null = 全量 395K（论文设置）；先用子集练手更省时。
+  num_train_samples: 100000
+
+# ---- 适配器（PiSSA / LoRA 共用；Full-FT 忽略）----
+adapter:
+  r: 128
+  alpha: 128            # alpha == r → scaling = 1（论文设置）
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  niter: null           # null=精确 SVD；整数则用 Fast SVD
+
+# ---- 优化器 / 调度 ----
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  global_batch_size: 128   # 全局 batch，由 per_device_batch * grad_accum 凑出
+
+# ---- 训练通用 ----
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10            # 每多少个 optimizer step 记一次 loss
+  save_merged_dtype: bfloat16   # 训练后合并保存的精度（省磁盘，评测足够）
+
+# ---- 每种方法的显存策略（96GB 单卡）----
+# PiSSA/LoRA：base 权重 fp32 冻结，只训适配器 → fp32 可行。
+# Full-FT：7B fp32 装不下（参数+AdamW 状态+梯度 ≈112GB），改 bf16 + 8bit-Adam + 梯度检查点。
+methods:
+  pissa:
+    dtype: float32
+    per_device_batch: 8       # batch 提到 8（grad_accum 配 16 凑 128）
+    grad_accum: 16            # 8 * 16 = 128
+    optimizer: adamw          # adamw 或 adamw_8bit
+    grad_checkpointing: true  # fp32 激活很占显存，必须开检查点，否则 OOM
+    learning_rate: null       # null = 用 optim.learning_rate
+  lora:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw_8bit     # 需 bitsandbytes；缺失则回退 adamw（bf16 状态）
+    grad_checkpointing: true
+    learning_rate: null
+
+# ---- 评测 ----
+eval:
+  max_new_tokens: 512
+  batch_size: 16
+
+# ---- 产物路径 ----
+paths:
+  output_dir: results/m1/exp1
+  ckpt_dir: checkpoints/m1

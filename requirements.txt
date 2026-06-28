@@ -11,3 +11,15 @@ peft>=0.12
 
 # MNIST 玩具实验：
 torchvision>=0.17
+
+# ---- M1 训练（LLaMA-2-7B on MetaMathQA -> GSM8K）----
+# 注意：服务器镜像已自带匹配显卡的 torch（2.8.0+cu128），安装下列包时不要让 pip 改动 torch。
+datasets>=2.20,<4      # 4.0+ 删了 as_dataset(verification_mode=)，与 modelscope MsDataset 不兼容
+accelerate>=0.30
+sentencepiece>=0.2     # LLaMA 分词器
+protobuf>=4.0
+modelscope>=1.15       # 免申请下载 LLaMA-2-7B / 数据集（HF gated/不可达时）
+addict                 # modelscope MsDataset 依赖（主包不自动带）
+simplejson             # 同上
+sortedcontainers       # 同上
+bitsandbytes>=0.43     # Full-FT 的 8bit-Adam（也供 M3 的 NF4 量化）
