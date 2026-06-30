@@ -33,3 +33,6 @@ Thumbs.db
 
 # ---- 实验追踪 ----
 wandb/
+
+# ---- 论文模板（外部模板，不上库）----
+NeurReps_2024_Template/
