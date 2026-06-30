@@ -1,7 +1,15 @@
-"""[M3] Table 4：量化重建误差对比（QPiSSA vs QLoRA）。
+"""[M3] Table 4：量化重建误差对比（QPiSSA vs QLoRA），对齐原论文口径。
 
-用法：
-    python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml
+度量与原文 (PiSSA, NeurIPS 2024, Table 4) 一致：
+  量化误差降低率 = (1 - ||W_res - nf4(W_res)||_* / ||W - nf4(W)||_*) * 100%
+其中 ||·||_* 为**核范数**（nuclear / 奇异值之和）。按投影类型 (Q/K/V/O/Gate/Up/Down)
+分组、跨全部层求平均，AVG = 各投影类型平均值的均值（与原文表头一致）。
+
+同时保留 Frobenius 范数下的降低率作参考（旧口径，便于对照历史结果）。
+
+用法（需基座模型权重 + CUDA；纯前向计算，不训练）：
+    python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml          # 全部层（对齐原文）
+    python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml --layers 2  # 冒烟（前 2 层）
 """
 
 from __future__ import annotations
@@ -9,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +52,11 @@ def nf4_quant_dequant(w: torch.Tensor, compute_dtype=torch.float32) -> torch.Ten
     w_nf4, quant_state = bnb.functional.quantize_nf4(w_fp)
     w_dq = bnb.functional.dequantize_nf4(w_nf4, quant_state)
     return w_dq.to(dtype=w.dtype)
+
+
+def nuclear_norm(m: torch.Tensor) -> float:
+    """核范数 ||M||_* = 奇异值之和（对齐原文量化误差度量）。"""
+    return torch.linalg.svdvals(m.to(torch.float32)).sum().item()
 
 
 def linear_layers(model: nn.Module, target_modules: tuple[str, ...]) -> list[tuple[str, nn.Linear]]:
@@ -85,60 +99,95 @@ def main() -> None:
 
     results = []
     for name, module in lines:
+        proj = name.rsplit(".", 1)[-1]  # 投影类型：q_proj/k_proj/.../down_proj
         W = module.weight.data.detach().to(dtype=compute_dtype)
         try:
-            # === 1. 基线量化误差（NF4 量化原权重）===
+            # === 1. 基线：NF4 直接量化原权重 W ===
             W_q = nf4_quant_dequant(W, compute_dtype)
-            err_baseline = (W - W_q).norm().item()
 
-            # === 2. PiSSA SVD 分解 ===
+            # === 2. PiSSA SVD 分解，得到残差 W_res ===
             init = pissa_init(W, r=r, niter=None)
             err_svd = reconstruction_error_against(init, W)
             W_res = init.residual.to(dtype=compute_dtype)
-            A = init.lora_A.to(dtype=compute_dtype)  # (r, in_features)
-            B = init.lora_B.to(dtype=compute_dtype)  # (out_features, r)
 
-            # === 3. 量化残差 ===
+            # === 3. NF4 量化残差 W_res ===
             W_res_q = nf4_quant_dequant(W_res, compute_dtype)
-            W_pissa_rec = W_res_q + B @ A
-            err_pissa = (W - W_pissa_rec).norm().item()
 
-            # === 4. LoRA 初始化误差（A=rand, B=0 → 增量为 0）===
-            # LoRA 初始增量为 0，所以重建 = NF4(W)
-            err_lora = err_baseline  # 同上
+            # === 4. 误差降低率 ===
+            #   QLoRA  误差 = ||W      - nf4(W)     ||   （baseline）
+            #   QPiSSA 误差 = ||W_res  - nf4(W_res) ||   （因 W-(nf4(W_res)+AB)=W_res-nf4(W_res)）
+            # 原文口径用核范数；同时保留 Frobenius 作参考。
+            base_nuc = nuclear_norm(W - W_q)
+            pissa_nuc = nuclear_norm(W_res - W_res_q)
+            red_nuc = (1.0 - pissa_nuc / max(base_nuc, 1e-12)) * 100.0
+
+            base_fro = (W - W_q).norm().item()
+            pissa_fro = (W_res - W_res_q).norm().item()
+            red_fro = (1.0 - pissa_fro / max(base_fro, 1e-12)) * 100.0
 
             results.append({
                 "layer": name,
+                "proj_type": proj,
                 "in_features": module.in_features,
                 "out_features": module.out_features,
-                "baseline_nf4_err": round(err_baseline, 6),
-                "pissa_nf4_err": round(err_pissa, 6),
+                # 原文口径（核范数）
+                "baseline_err_nuclear": round(base_nuc, 6),
+                "pissa_err_nuclear": round(pissa_nuc, 6),
+                "reduction_pct_nuclear": round(red_nuc, 4),
+                # 参考口径（Frobenius，旧结果）
+                "baseline_err_frobenius": round(base_fro, 6),
+                "pissa_err_frobenius": round(pissa_fro, 6),
+                "reduction_pct_frobenius": round(red_fro, 4),
                 "svd_recon_err": round(err_svd, 8),
             })
 
-            rel_improve = (err_baseline - err_pissa) / max(err_baseline, 1e-12) * 100
-            print(f"  {name}: baseline={err_baseline:.4f}  pissa={err_pissa:.4f}  "
-                  f"(↓{rel_improve:.1f}%)  svd_err={err_svd:.2e}")
+            print(f"  {name}: reduction(nuc)={red_nuc:5.1f}%  "
+                  f"reduction(fro)={red_fro:5.1f}%  svd_err={err_svd:.2e}")
 
         except Exception as e:
             print(f"  {name}: SKIP ({e})")
-            results.append({"layer": name, "error": str(e)})
+            results.append({"layer": name, "proj_type": proj, "error": str(e)})
 
-    # ---- 汇总 ----
-    valid = [r for r in results if "pissa_nf4_err" in r]
+    # ---- 汇总：按投影类型分组（对齐原文 Table 4）----
+    valid = [r for r in results if "reduction_pct_nuclear" in r]
+    summary = {"error": "no valid results"}
     if valid:
-        avg_baseline = sum(r["baseline_nf4_err"] for r in valid) / len(valid)
-        avg_pissa = sum(r["pissa_nf4_err"] for r in valid) / len(valid)
+        by_type_nuc: dict[str, list[float]] = defaultdict(list)
+        by_type_fro: dict[str, list[float]] = defaultdict(list)
+        for r in valid:
+            by_type_nuc[r["proj_type"]].append(r["reduction_pct_nuclear"])
+            by_type_fro[r["proj_type"]].append(r["reduction_pct_frobenius"])
+
+        # 原文表头顺序
+        order = ["q_proj", "k_proj", "v_proj", "o_proj",
+                 "gate_proj", "up_proj", "down_proj"]
+        types = [t for t in order if t in by_type_nuc] + \
+                sorted(t for t in by_type_nuc if t not in order)
+
+        per_type_nuc = {t: round(sum(by_type_nuc[t]) / len(by_type_nuc[t]), 2) for t in types}
+        per_type_fro = {t: round(sum(by_type_fro[t]) / len(by_type_fro[t]), 2) for t in types}
+        # AVG = 各投影类型平均值的均值（与原文一致）
+        avg_nuc = round(sum(per_type_nuc.values()) / len(per_type_nuc), 2)
+        avg_fro = round(sum(per_type_fro.values()) / len(per_type_fro), 2)
+
         summary = {
+            "metric": "quantization error reduction ratio (%) vs NF4(W) baseline",
+            "norm": "nuclear (paper) + frobenius (reference)",
             "num_layers": len(valid),
-            "avg_baseline_nf4_err": round(avg_baseline, 4),
-            "avg_pissa_nf4_err": round(avg_pissa, 4),
-            "avg_improvement_pct": round((avg_baseline - avg_pissa) / max(avg_baseline, 1e-12) * 100, 2),
+            "reduction_pct_nuclear_by_type": per_type_nuc,
+            "reduction_pct_nuclear_AVG": avg_nuc,
+            "reduction_pct_frobenius_by_type": per_type_fro,
+            "reduction_pct_frobenius_AVG": avg_fro,
         }
-        print(f"\n总计：{len(valid)} 层, 平均 NF4 误差 {avg_baseline:.4f} → PiSSA {avg_pissa:.4f}"
-              f"  (改善 {summary['avg_improvement_pct']:.1f}%)")
-    else:
-        summary = {"error": "no valid results"}
+
+        # 终端打印一个类原文 Table 4 的小表
+        print("\n=== Table 4（量化误差降低率 %，对齐原文核范数口径）===")
+        header = "  " + "".join(f"{t.replace('_proj',''):>8}" for t in types) + f"{'AVG':>8}"
+        print(header)
+        row_nuc = "  " + "".join(f"{per_type_nuc[t]:>8.1f}" for t in types) + f"{avg_nuc:>8.1f}"
+        print(f"nuclear{row_nuc}")
+        row_fro = "  " + "".join(f"{per_type_fro[t]:>8.1f}" for t in types) + f"{avg_fro:>8.1f}"
+        print(f"froben.{row_fro}")
 
     # ---- 保存 ----
     out_dir = abspath(cfg["paths"]["output_dir"])

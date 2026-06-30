@@ -52,11 +52,13 @@ All numbers are GSM8K exact-match accuracy (test set, 1319 problems). Adapter ra
 | QPiSSA | 0.4114 | 0.2297 |
 | QLoRA | 0.3964 | **0.2722** |
 
-**Table 4 — NF4 quantization reconstruction error** (avg over sampled layers):
+**Table 4 — NF4 quantization reconstruction error**:
 
 | | Baseline NF4 error | PiSSA-residual NF4 error | Improvement |
 |---|:---:|:---:|:---:|
-| value | 7.19% | 1.51% | **79.0%** |
+| value (Frobenius, 2 layers) | 7.19% | 1.51% | **79.0%** |
+
+> Note: the number above uses the **Frobenius** norm over only 2 sampled layers, so the reduction ratio is inflated. `scripts/m3/table4.py` has since been updated to match the original paper's metric — **nuclear-norm** error-reduction ratio, computed over **all** layers and grouped by projection type (Q/K/V/O/Gate/Up/Down), with `AVG` = mean of per-type means. Re-run on the server (`python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml`) to obtain the paper-aligned table (expected PiSSA AVG ≈ 19% for LLaMA-2-7B, highest on Q). The Frobenius reduction is still emitted as a reference field.
 
 > QPiSSA mathematically reduces the NF4 quantization error of the frozen residual (Table 4), but in end-to-end training it underperformed QLoRA. The most likely cause is our from-scratch NF4 path in `src/pissa/layer_nf4.py` (CPU→GPU dequantize each forward) being numerically weaker than bitsandbytes' native fused 4-bit matmul kernel used by QLoRA. Reported honestly as an engineering limitation.
 
