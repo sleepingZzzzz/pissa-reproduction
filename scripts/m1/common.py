@@ -62,6 +62,9 @@ def torch_dtype(name: str) -> torch.dtype:
 def resolve_model_path(cfg: dict) -> str:
     """返回可直接喂给 from_pretrained 的本地目录或 repo id。"""
     mcfg = cfg["model"]
+    # local_path 优先级最高：直接指向已下载的本地目录，跳过 snapshot_download
+    if mcfg.get("local_path", ""):
+        return str(abspath(mcfg["local_path"]))
     if mcfg["source"] == "modelscope":
         from modelscope import snapshot_download
 
@@ -80,23 +83,58 @@ def resolve_model_path(cfg: dict) -> str:
     raise ValueError(f"未知 model.source={mcfg['source']}")
 
 
-def load_tokenizer(model_path: str):
+def load_tokenizer(model_path: str, trust_remote_code: bool = False):
     from transformers import AutoTokenizer
 
-    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=trust_remote_code)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    tok.padding_side = "right"
+    # 不强制 padding_side：Collator 自行构造右填充张量，不依赖 tokenizer 的 padding 方向。
+    # ChatGLM 等模型 tokenizer 的 _pad 断言 padding_side=="left"，强制改右会在 tokenize_example 中断言失败。
     return tok
 
 
-def load_base_model(model_path: str, dtype: torch.dtype):
+def load_base_model(model_path: str, dtype: torch.dtype, trust_remote_code: bool = False, low_cpu_mem_usage: bool = True, quantization_config=None):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=dtype, low_cpu_mem_usage=True
+        model_path, dtype=dtype, low_cpu_mem_usage=low_cpu_mem_usage,
+        trust_remote_code=trust_remote_code, quantization_config=quantization_config
     )
     return model
+
+
+def fix_unregistered_meta_tensors(model: nn.Module, device: torch.device) -> None:
+    """修复从 from_pretrained 加载后残留在 meta device 的未注册缓存 tensor。
+
+    Baichuan2 等模型的 RotaryEmbedding 将 cos_cached/sin_cached/inv_freq 作为
+    普通 tensor 属性（非 nn.Parameter/Buffer 注册），model.to(device) 不会移动它们。
+    low_cpu_mem_usage 的 _fast_init 会使其留在 meta device，load_state_dict 不包含
+    它们 → 首次 forward 时 .to(device) 报 ``NotImplementedError: Cannot copy out of
+    meta tensor; no data!``。
+
+    本函数遍历所有子模块，在目标 device 上重建这些缓存。
+    """
+    for module in model.modules():
+        cos = getattr(module, 'cos_cached', None)
+        sin = getattr(module, 'sin_cached', None)
+        if not isinstance(cos, torch.Tensor) or not isinstance(sin, torch.Tensor):
+            continue
+        if str(cos.device) != 'meta' and str(sin.device) != 'meta':
+            continue
+
+        max_len = getattr(module, 'max_seq_len_cached', 2048)
+        base = getattr(module, 'base', 10000.0)
+        # 从 cos_cached 的最后一维反推 dim（emb 形状 [1, 1, max_len, dim]）
+        dim = cos.shape[-1] if cos.ndim >= 2 else 128
+
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=device).float() / dim))
+        module.inv_freq = inv_freq
+        t = torch.arange(max_len, device=device, dtype=torch.float32)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        module.cos_cached = emb.cos()[None, None, :, :].to(torch.float32)
+        module.sin_cached = emb.sin()[None, None, :, :].to(torch.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +154,8 @@ class LoRALinear(nn.Module):
         else:
             self.bias = None
         # 标准 LoRA 初始化：A ~ Kaiming uniform，B = 0 → 初始增量为 0。
-        self.lora_A = nn.Parameter(torch.empty(r, self.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r))
+        self.lora_A = nn.Parameter(torch.empty(r, self.in_features, dtype=self.weight.dtype))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, dtype=self.weight.dtype))
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -136,6 +174,42 @@ class LoRALinear(nn.Module):
         if self.bias is not None:
             lin.bias.data.copy_(self.bias)
         return lin
+
+
+# ---------------------------------------------------------------------------
+# QLoRA: 在 4-bit 量化模型上添加 LoRA 适配器（保持 4-bit base 层不改动）
+# ---------------------------------------------------------------------------
+class QLoRALinear(nn.Module):
+    """包装 4-bit Linear 层 + LoRA A/B，forward = 4bit_base(x) + lora_delta。"""
+
+    def __init__(self, linear_4bit: nn.Linear, r: int, alpha: float | None = None, dtype=torch.bfloat16):
+        super().__init__()
+        self.in_features = linear_4bit.in_features
+        self.out_features = linear_4bit.out_features
+        self.r = r
+        self.alpha = float(alpha) if alpha is not None else float(r)
+        self.scaling = self.alpha / r
+        # 保持 4-bit base 层作为 frozen 子模块（不 clone weight）
+        self.base = linear_4bit
+        for p in self.base.parameters():
+            p.requires_grad_(False)
+        # LoRA A/B 使用计算精度
+        self.lora_A = nn.Parameter(torch.empty(r, self.in_features, dtype=dtype))
+        self.lora_B = nn.Parameter(torch.zeros(self.out_features, r, dtype=dtype))
+        nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = self.base(x)
+        delta = F.linear(F.linear(x, self.lora_A), self.lora_B)
+        return base + self.scaling * delta
+
+    @torch.no_grad()
+    def merged_weight(self) -> torch.Tensor:
+        raise NotImplementedError("QLoRA 不能合并 4-bit base weight")
+
+    @torch.no_grad()
+    def to_linear(self) -> nn.Linear:
+        raise NotImplementedError("QLoRA 不能折叠为 nn.Linear")
 
 
 def _match(name: str, targets: tuple[str, ...]) -> bool:
@@ -171,6 +245,71 @@ def merge_lora(model: nn.Module) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# QPiSSA (NF4-quantized residual) injection
+# ---------------------------------------------------------------------------
+def inject_qpissa(model: nn.Module, r: int, alpha, target_modules, niter=None) -> list[str]:
+    from pissa.layer_nf4 import NFPiSSALinear
+
+    replaced: list[str] = []
+    to_replace = [
+        (n, m)
+        for n, m in model.named_modules()
+        if isinstance(m, nn.Linear) and _match(n, tuple(target_modules))
+    ]
+    for name, module in tqdm(to_replace, desc="QPiSSA NF4 注入", unit="layer"):
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        child = name.rsplit(".", 1)[-1]
+        layer = NFPiSSALinear.from_linear(module, r=r, alpha=alpha, niter=niter).to(
+            module.weight.device, module.weight.dtype
+        )
+        setattr(parent, child, layer)
+        del module  # 释放旧 Linear 层
+        replaced.append(name)
+        # 每 8 层清理一次 CUDA 缓存，防止 SVD 临时 tensor 累积
+        if len(replaced) % 8 == 0:
+            import gc
+            gc.collect()
+            torch.cuda.empty_cache()
+    return replaced
+
+
+# ---------------------------------------------------------------------------
+# QLoRA (LoRA on top of 4-bit base)
+# ---------------------------------------------------------------------------
+def inject_lora_4bit(model: nn.Module, r: int, alpha, target_modules) -> list[str]:
+    """在 4-bit 量化模型上添加 LoRA 适配器。保持 4-bit base 层不变。"""
+    replaced: list[str] = []
+    to_replace = [
+        (n, m)
+        for n, m in model.named_modules()
+        if isinstance(m, nn.Linear) and _match(n, tuple(target_modules))
+    ]
+    for name, module in tqdm(to_replace, desc="QLoRA 注入", unit="layer"):
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        child = name.rsplit(".", 1)[-1]
+        # 4-bit Linear4bit → QLoRALinear wrapper（不 clone uint8 weight）
+        layer = QLoRALinear(module, r=r, alpha=alpha).to(module.weight.device)
+        setattr(parent, child, layer)
+        replaced.append(name)
+    return replaced
+
+
+def unwrap_qlora(model: nn.Module, adapter_sd: dict[str, torch.Tensor] | None = None) -> list[str]:
+    """解包 QLoRALinear → 原始 Linear4bit，可选提取 adapter state_dict。"""
+    unwrapped: list[str] = []
+    to_unwrap = [(n, m) for n, m in model.named_modules() if isinstance(m, QLoRALinear)]
+    for name, module in tqdm(to_unwrap, desc="解包 QLoRA", unit="layer"):
+        parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
+        child = name.rsplit(".", 1)[-1]
+        if adapter_sd is not None:
+            adapter_sd[f"{name}.lora_A"] = module.lora_A.data.clone().cpu()
+            adapter_sd[f"{name}.lora_B"] = module.lora_B.data.clone().cpu()
+        setattr(parent, child, module.base)
+        unwrapped.append(name)
+    return unwrapped
+
+
+# ---------------------------------------------------------------------------
 # 适配器注入：根据方法配置模型可训练性
 # ---------------------------------------------------------------------------
 def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
@@ -203,6 +342,27 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
         for n, p in model.named_parameters():
             p.requires_grad_("lora_A" in n or "lora_B" in n)
         n_replaced = len(replaced)
+    elif method == "qpissa":
+        # QPiSSA: FP16 加载 → PiSSA SVD → NF4 量化残差
+        for p in model.parameters():
+            p.requires_grad_(False)
+        replaced = inject_qpissa(
+            model, r=acfg["r"], alpha=acfg["alpha"],
+            target_modules=tuple(acfg["target_modules"]), niter=acfg["niter"],
+        )
+        for n, p in model.named_parameters():
+            p.requires_grad_("lora_A" in n or "lora_B" in n)
+        n_replaced = len(replaced)
+    elif method == "qlora":
+        # QLoRA: 4-bit 模型上直接添加 LoRA（不 clone 4-bit weight）
+        for p in model.parameters():
+            p.requires_grad_(False)
+        replaced = inject_lora_4bit(
+            model, r=acfg["r"], alpha=acfg["alpha"], target_modules=acfg["target_modules"]
+        )
+        for n, p in model.named_parameters():
+            p.requires_grad_("lora_A" in n or "lora_B" in n)
+        n_replaced = len(replaced)
     else:
         raise ValueError(f"未知 method={method}")
 
@@ -219,7 +379,11 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
 def merge_adapter(model: nn.Module, method: str) -> None:
     if method == "pissa":
         merge_pissa(model)
+    elif method == "qpissa":
+        merge_pissa(model)  # NFPiSSALinear is a subclass of PiSSALinear
     elif method == "lora":
+        merge_lora(model)
+    elif method == "qlora":
         merge_lora(model)
     # full：无需合并。
 

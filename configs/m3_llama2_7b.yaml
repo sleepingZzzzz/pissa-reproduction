@@ -1,0 +1,82 @@
+#  M3：QPiSSA — NF4 量化下的 PiSSA vs LoRA
+#  1. Table 4：量化重建误差（纯计算，无需训练）
+#  2. Fig.5：4-bit 训练收敛曲线（NF4 + MetaMathQA 训练，GSM8K 评测）
+
+experiment: m3_qpissa_llama2_7b
+
+# ---- 模型 ----
+model:
+  name: Llama-2-7b
+  source: local
+  local_path: data/m1/models/modelscope/Llama-2-7b-ms
+
+# ---- 量化 ----
+quantization:
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_quant_type: nf4
+
+# ---- 数据（复用 M1）----
+data:
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 20000
+
+# ---- 适配器 ----
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  niter: null
+
+# ---- 优化器 / 调度 ----
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+
+# ---- 训练通用 ----
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+
+# ---- 方法（NF4 训练）----
+methods:
+  qpissa:
+    dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  qlora:
+    dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+
+# ---- 评测 ----
+eval:
+  max_new_tokens: 512
+  batch_size: 16
+
+# ---- 产物路径 ----
+paths:
+  output_dir: results/m3_qpissa/exp1
+  ckpt_dir: checkpoints/m3_qpissa

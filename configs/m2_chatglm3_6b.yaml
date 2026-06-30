@@ -1,0 +1,71 @@
+# M2：ChatGLM3-6B-Base 在 MetaMathQA 上微调，GSM8K 评测。
+# 目标：验证 PiSSA 在 GLM 架构（与 LLaMA 完全不同）上的泛用性。
+
+experiment: m2_chatglm3_6b
+
+model:
+  name: ChatGLM3-6B-Base
+  source: local
+  local_path: data/m2/models/ChatGLM3-6B-Base/ZhipuAI/chatglm3-6b-base
+  trust_remote_code: true          # ChatGLM3 必须
+
+data:
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 20000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:                  # GLM 架构专有命名
+    - query_key_value
+    - dense
+    - dense_h_to_4h
+    - dense_4h_to_h
+  niter: null
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+
+methods:
+  pissa:
+    dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  lora:
+    dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw_8bit
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 512
+  batch_size: 16
+
+paths:
+  output_dir: results/m2_chatglm3_6b/exp1
+  ckpt_dir: checkpoints/m2_chatglm3_6b

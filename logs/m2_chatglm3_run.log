@@ -1,0 +1,202 @@
+nohup: ignoring input
+=== Sun Jun 28 17:36:00 CST 2026 ChatGLM3 PiSSA 训练 ===
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+方法=pissa 设备=cuda dtype=bfloat16
+Loading weights:   0%|          | 0/200 [00:00<?, ?it/s]Loading weights:   0%|          | 1/200 [00:00<02:58,  1.12it/s]Loading weights:  13%|█▎        | 26/200 [00:01<00:07, 22.55it/s]Loading weights:  16%|█▋        | 33/200 [00:01<00:06, 27.68it/s]Loading weights:  20%|██        | 40/200 [00:01<00:06, 24.18it/s]Loading weights:  24%|██▎       | 47/200 [00:02<00:05, 25.86it/s]Loading weights:  27%|██▋       | 54/200 [00:02<00:05, 25.15it/s]Loading weights:  30%|███       | 61/200 [00:02<00:05, 27.56it/s]Loading weights:  34%|███▍      | 68/200 [00:02<00:05, 25.99it/s]Loading weights:  38%|███▊      | 75/200 [00:03<00:04, 25.54it/s]Loading weights:  41%|████      | 82/200 [00:03<00:04, 27.36it/s]Loading weights:  44%|████▍     | 88/200 [00:03<00:03, 31.90it/s]Loading weights:  46%|████▌     | 92/200 [00:03<00:04, 25.27it/s]Loading weights:  48%|████▊     | 96/200 [00:04<00:04, 23.85it/s]Loading weights:  52%|█████▏    | 103/200 [00:04<00:03, 26.93it/s]Loading weights:  55%|█████▌    | 110/200 [00:04<00:03, 25.59it/s]Loading weights:  58%|█████▊    | 117/200 [00:04<00:02, 28.27it/s]Loading weights:  62%|██████▏   | 124/200 [00:05<00:03, 23.32it/s]Loading weights:  69%|██████▉   | 138/200 [00:05<00:02, 28.27it/s]Loading weights:  72%|███████▎  | 145/200 [00:05<00:02, 26.61it/s]Loading weights:  76%|███████▌  | 152/200 [00:05<00:01, 31.82it/s]Loading weights:  80%|███████▉  | 159/200 [00:06<00:01, 28.39it/s]Loading weights:  83%|████████▎ | 166/200 [00:06<00:01, 24.33it/s]Loading weights:  86%|████████▋ | 173/200 [00:06<00:00, 29.85it/s]Loading weights:  90%|█████████ | 180/200 [00:06<00:00, 31.49it/s]Loading weights:  93%|█████████▎| 186/200 [00:07<00:00, 30.94it/s]Loading weights:  95%|█████████▌| 190/200 [00:07<00:00, 31.78it/s]Loading weights:  97%|█████████▋| 194/200 [00:07<00:00, 33.11it/s]Loading weights: 100%|█████████▉| 199/200 [00:07<00:00, 34.96it/s]Loading weights: 100%|██████████| 200/200 [00:07<00:00, 26.85it/s]
+Traceback (most recent call last):
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/train.py", line 218, in <module>
+    main()
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/train.py", line 73, in main
+    model = load_base_model(model_path, dtype, trust_remote_code=trc)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/common.py", line 99, in load_base_model
+    model = AutoModelForCausalLM.from_pretrained(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/auto_factory.py", line 391, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4328, in from_pretrained
+    loading_info = cls._finalize_model_loading(model, load_config, loading_info)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4484, in _finalize_model_loading
+    model._move_missing_keys_from_meta_to_device(
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4774, in _move_missing_keys_from_meta_to_device
+    for key in missing_keys - self.all_tied_weights_keys.keys():
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1962, in __getattr__
+    raise AttributeError(
+AttributeError: 'ChatGLMForConditionalGeneration' object has no attribute 'all_tied_weights_keys'. Did you mean: '_tied_weights_keys'?
+=== Sun Jun 28 17:36:13 CST 2026 ChatGLM3 PiSSA 评测 ===
+加载模型：/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/pissa
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 437, in cached_files
+    hf_hub_download(
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 84, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 132, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/pissa'. Use `repo_type` argument if needed.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/tokenization_auto.py", line 716, in from_pretrained
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/configuration_auto.py", line 376, in from_pretrained
+    config_dict, unused_kwargs = PreTrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 687, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 742, in _get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 293, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 488, in cached_files
+    raise OSError(f"{e}") from e
+OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/pissa'. Use `repo_type` argument if needed.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 437, in cached_files
+    hf_hub_download(
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 84, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 132, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/pissa'. Use `repo_type` argument if needed.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/eval_gsm8k.py", line 121, in <module>
+    main()
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/eval_gsm8k.py", line 63, in main
+    tokenizer = load_tokenizer(ckpt_dir, trust_remote_code=trc)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/common.py", line 89, in load_tokenizer
+    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=trust_remote_code)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/tokenization_auto.py", line 720, in from_pretrained
+    config = PreTrainedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 646, in from_pretrained
+    config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 687, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 742, in _get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 293, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 488, in cached_files
+    raise OSError(f"{e}") from e
+OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/pissa'. Use `repo_type` argument if needed.
+=== Sun Jun 28 17:36:17 CST 2026 ChatGLM3 LoRA 训练 ===
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+方法=lora 设备=cuda dtype=bfloat16
+Loading weights:   0%|          | 0/200 [00:00<?, ?it/s]Loading weights:   0%|          | 1/200 [00:01<03:56,  1.19s/it]Loading weights:  10%|▉         | 19/200 [00:01<00:09, 19.85it/s]Loading weights:  14%|█▍        | 29/200 [00:01<00:06, 26.96it/s]Loading weights:  18%|█▊        | 37/200 [00:01<00:06, 26.16it/s]Loading weights:  22%|██▏       | 43/200 [00:02<00:06, 24.99it/s]Loading weights:  24%|██▍       | 48/200 [00:02<00:06, 22.19it/s]Loading weights:  27%|██▋       | 54/200 [00:02<00:06, 23.32it/s]Loading weights:  30%|███       | 61/200 [00:02<00:05, 26.15it/s]Loading weights:  34%|███▍      | 68/200 [00:03<00:05, 22.77it/s]Loading weights:  38%|███▊      | 75/200 [00:03<00:04, 26.20it/s]Loading weights:  41%|████      | 82/200 [00:03<00:03, 31.55it/s]Loading weights:  44%|████▍     | 88/200 [00:03<00:03, 36.18it/s]Loading weights:  46%|████▋     | 93/200 [00:03<00:04, 25.18it/s]Loading weights:  48%|████▊     | 97/200 [00:04<00:04, 24.00it/s]Loading weights:  52%|█████▏    | 103/200 [00:04<00:03, 25.29it/s]Loading weights:  55%|█████▌    | 110/200 [00:04<00:04, 22.23it/s]Loading weights:  58%|█████▊    | 117/200 [00:04<00:03, 27.51it/s]Loading weights:  62%|██████▏   | 124/200 [00:05<00:02, 29.85it/s]Loading weights:  66%|██████▌   | 131/200 [00:05<00:02, 24.96it/s]Loading weights:  69%|██████▉   | 138/200 [00:05<00:02, 26.87it/s]Loading weights:  72%|███████▎  | 145/200 [00:06<00:02, 23.58it/s]Loading weights:  76%|███████▌  | 152/200 [00:06<00:01, 28.63it/s]Loading weights:  80%|███████▉  | 159/200 [00:06<00:01, 30.25it/s]Loading weights:  83%|████████▎ | 166/200 [00:06<00:01, 25.18it/s]Loading weights:  86%|████████▋ | 173/200 [00:07<00:01, 24.92it/s]Loading weights:  90%|█████████ | 180/200 [00:07<00:00, 24.42it/s]Loading weights:  94%|█████████▎| 187/200 [00:07<00:00, 29.36it/s]Loading weights: 100%|█████████▉| 199/200 [00:07<00:00, 36.64it/s]Loading weights: 100%|██████████| 200/200 [00:07<00:00, 25.86it/s]
+Traceback (most recent call last):
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/train.py", line 218, in <module>
+    main()
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/train.py", line 73, in main
+    model = load_base_model(model_path, dtype, trust_remote_code=trc)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/common.py", line 99, in load_base_model
+    model = AutoModelForCausalLM.from_pretrained(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/auto_factory.py", line 391, in from_pretrained
+    return model_class.from_pretrained(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4328, in from_pretrained
+    loading_info = cls._finalize_model_loading(model, load_config, loading_info)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4484, in _finalize_model_loading
+    model._move_missing_keys_from_meta_to_device(
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/modeling_utils.py", line 4774, in _move_missing_keys_from_meta_to_device
+    for key in missing_keys - self.all_tied_weights_keys.keys():
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1962, in __getattr__
+    raise AttributeError(
+AttributeError: 'ChatGLMForConditionalGeneration' object has no attribute 'all_tied_weights_keys'. Did you mean: '_tied_weights_keys'?
+=== Sun Jun 28 17:36:31 CST 2026 ChatGLM3 LoRA 评测 ===
+加载模型：/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/lora
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 437, in cached_files
+    hf_hub_download(
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 84, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 132, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/lora'. Use `repo_type` argument if needed.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/tokenization_auto.py", line 716, in from_pretrained
+    config = AutoConfig.from_pretrained(
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/configuration_auto.py", line 376, in from_pretrained
+    config_dict, unused_kwargs = PreTrainedConfig.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 687, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 742, in _get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 293, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 488, in cached_files
+    raise OSError(f"{e}") from e
+OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/lora'. Use `repo_type` argument if needed.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 437, in cached_files
+    hf_hub_download(
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 84, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/root/miniconda3/lib/python3.12/site-packages/huggingface_hub/utils/_validators.py", line 132, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/lora'. Use `repo_type` argument if needed.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/eval_gsm8k.py", line 121, in <module>
+    main()
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/eval_gsm8k.py", line 63, in main
+    tokenizer = load_tokenizer(ckpt_dir, trust_remote_code=trc)
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/autodl-tmp/pissa-reproduction/scripts/m1/common.py", line 89, in load_tokenizer
+    tok = AutoTokenizer.from_pretrained(model_path, use_fast=True, trust_remote_code=trust_remote_code)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/models/auto/tokenization_auto.py", line 720, in from_pretrained
+    config = PreTrainedConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 646, in from_pretrained
+    config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 687, in get_config_dict
+    config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/configuration_utils.py", line 742, in _get_config_dict
+    resolved_config_file = cached_file(
+                           ^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 293, in cached_file
+    file = cached_files(path_or_repo_id=path_or_repo_id, filenames=[filename], **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/miniconda3/lib/python3.12/site-packages/transformers/utils/hub.py", line 488, in cached_files
+    raise OSError(f"{e}") from e
+OSError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/root/autodl-tmp/pissa-reproduction/checkpoints/m2_chatglm3_6b/lora'. Use `repo_type` argument if needed.
+=== Sun Jun 28 17:36:36 CST 2026 ChatGLM3 全部完成 ===

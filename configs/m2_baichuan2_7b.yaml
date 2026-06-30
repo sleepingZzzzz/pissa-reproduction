@@ -1,0 +1,73 @@
+# M2：Baichuan2-7B-Base 在 MetaMathQA 上微调，GSM8K 评测。
+# 目标：验证 PiSSA 在 Baichuan 架构（ALiBi 替代 RoPE，不同归一化）上的泛用性。
+
+experiment: m2_baichuan2_7b
+
+model:
+  name: Baichuan2-7B-Base
+  source: local
+  local_path: data/m2/models/Baichuan2-7B-Base/baichuan-inc/Baichuan2-7B-Base
+  trust_remote_code: true            # Baichuan2 权重目录含自定义代码
+  low_cpu_mem_usage: false           # Baichuan2 自定义加载不兼容 meta device
+
+data:
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 20000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:                  # Baichuan2 使用 LLaMA 风格命名
+    - W_pack
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  niter: null
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+
+methods:
+  pissa:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  lora:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw_8bit
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 512
+  batch_size: 16
+
+paths:
+  output_dir: results/m2_baichuan2_7b/exp1
+  ckpt_dir: checkpoints/m2_baichuan2_7b

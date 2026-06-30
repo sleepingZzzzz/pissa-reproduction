@@ -1,0 +1,82 @@
+# M2：LLaMA-3-8B 在 MetaMathQA 上微调，GSM8K 评测。
+# 目标：验证 PiSSA 在 LLaMA-2→3 代际升级后仍有效。
+# 与 M1 统一参数 (r=128, α=128, global_batch=128) → 仅模型不同。
+
+experiment: m2_llama3_8b
+
+# ---- 模型 ----
+model:
+  name: LLaMA-3-8B
+  source: local
+  local_path: data/m2/models/Meta-Llama-3-8B/LLM-Research/Meta-Llama-3-8B
+
+# ---- 数据（复用 M1 已处理的 jsonl）----
+data:
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 20000
+
+# ---- 适配器（与 M1 完全一致）----
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+  niter: null
+
+# ---- 优化器 / 调度 ----
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+
+# ---- 训练通用 ----
+train:
+  num_epochs: 1
+  max_seq_len: 1024
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+
+# ---- M2 方法：bf16 全路径（20K 样本、无需梯度检查点、速度优先）----
+methods:
+  pissa:
+    dtype: bfloat16
+    per_device_batch: 8         # LLaMA-3 词表 128k，bs=16 时 logits 张量 ~8.4GB(fp32)，OOM
+    grad_accum: 16              # 8 × 16 = 128
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  lora:
+    dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: false
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw_8bit
+    grad_checkpointing: true
+    learning_rate: null
+
+# ---- 评测 ----
+eval:
+  max_new_tokens: 512
+  batch_size: 16
+
+# ---- 产物路径 ----
+paths:
+  output_dir: results/m2_llama3_8b/exp1
+  ckpt_dir: checkpoints/m2_llama3_8b

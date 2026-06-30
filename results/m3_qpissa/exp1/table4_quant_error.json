@@ -1,0 +1,42 @@
+{
+  "experiment": "M3/Table4 量化重建误差",
+  "timestamp": "2026-06-29T00:19:17",
+  "config": {
+    "r": 128,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ],
+    "quant_type": "nf4",
+    "compute_dtype": "torch.float32"
+  },
+  "summary": {
+    "num_layers": 2,
+    "avg_baseline_nf4_err": 7.1925,
+    "avg_pissa_nf4_err": 1.5105,
+    "avg_improvement_pct": 79.0
+  },
+  "per_layer": [
+    {
+      "layer": "model.layers.0.self_attn.q_proj",
+      "in_features": 4096,
+      "out_features": 4096,
+      "baseline_nf4_err": 7.012792,
+      "pissa_nf4_err": 1.401895,
+      "svd_recon_err": 0.0
+    },
+    {
+      "layer": "model.layers.0.self_attn.k_proj",
+      "in_features": 4096,
+      "out_features": 4096,
+      "baseline_nf4_err": 7.372127,
+      "pissa_nf4_err": 1.61908,
+      "svd_recon_err": 0.0
+    }
+  ]
+}

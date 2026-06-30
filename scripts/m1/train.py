@@ -26,6 +26,7 @@ from common import (
     abspath,
     apply_adapter,
     build_optimizer,
+    fix_unregistered_meta_tensors,
     load_base_model,
     load_config,
     load_tokenizer,
@@ -35,6 +36,7 @@ from common import (
     set_seed,
     tokenize_example,
     torch_dtype,
+    unwrap_qlora,
 )
 
 
@@ -48,7 +50,7 @@ def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description="[M1] 训练 PiSSA/LoRA/Full")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
-    parser.add_argument("--method", required=True, choices=["pissa", "lora", "full"])
+    parser.add_argument("--method", required=True, choices=["pissa", "lora", "full", "qpissa", "qlora"])
     parser.add_argument("--limit", type=int, default=None, help="只用前 N 条训练（冒烟）")
     args = parser.parse_args()
 
@@ -68,12 +70,37 @@ def main() -> None:
 
     # ---- 模型 / 分词器 ----
     model_path = resolve_model_path(cfg)
-    tokenizer = load_tokenizer(model_path)
-    model = load_base_model(model_path, dtype)
-    model.to(device)
+    trc = cfg.get("model", {}).get("trust_remote_code", False)
+    low_cpu = cfg.get("model", {}).get("low_cpu_mem_usage", True)
+    tokenizer = load_tokenizer(model_path, trust_remote_code=trc)
+
+    # NF4 量化配置（M3 QLoRA）。QPiSSA 走 FP16 加载→PiSSA SVD→NF4 残差，不走此分支。
+    quant_cfg = None
+    is_qlora = args.method == "qlora"
+    if is_qlora and cfg.get("quantization", {}).get("load_in_4bit"):
+        from transformers import BitsAndBytesConfig
+
+        q = cfg["quantization"]
+        quant_cfg = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch_dtype(q.get("bnb_4bit_compute_dtype", "bfloat16")),
+            bnb_4bit_use_double_quant=q.get("bnb_4bit_use_double_quant", True),
+            bnb_4bit_quant_type=q.get("bnb_4bit_quant_type", "nf4"),
+        )
+        model = load_base_model(model_path, quant_cfg.bnb_4bit_compute_dtype, trust_remote_code=trc,
+                                low_cpu_mem_usage=False, quantization_config=quant_cfg)
+        device = "cuda"
+    else:
+        model = load_base_model(model_path, dtype, trust_remote_code=trc, low_cpu_mem_usage=low_cpu)
+        model.to(device)
+    # Baichuan2 等模型的 RotaryEmbedding 缓存（cos_cached/sin_cached/inv_freq）是
+    # 普通 tensor 属性（未 register_buffer），model.to() 不会移动它们；
+    # low_cpu_mem_usage 的 _fast_init 使其留在 meta device → 首次 forward 必崩。
+    fix_unregistered_meta_tensors(model, device)
     if mcfg["grad_checkpointing"]:
         model.gradient_checkpointing_enable()
-        model.config.use_cache = False
+        if hasattr(model.config, "use_cache"):
+            model.config.use_cache = False
 
     stats = apply_adapter(model, args.method, cfg)
     print(
@@ -159,12 +186,21 @@ def main() -> None:
     pbar.close()
 
     # ---- 合并 + 保存 ----
-    merge_adapter(model, args.method)
-    save_dtype = torch_dtype(tcfg["save_merged_dtype"])
-    model.to(save_dtype)
     ckpt_dir = abspath(cfg["paths"]["ckpt_dir"]) / args.method
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    model.config.use_cache = True
+    if args.method == "qlora":
+        # QLoRA: 不合并 4-bit base，仅保存 LoRA adapter 权重
+        adapter_state: dict[str, torch.Tensor] = {}
+        unwrap_qlora(model, adapter_state)
+        adapter_dir = ckpt_dir / "lora_weights"
+        adapter_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(adapter_state, str(adapter_dir / "adapter_model.bin"))
+    else:
+        merge_adapter(model, args.method)
+        save_dtype = torch_dtype(tcfg["save_merged_dtype"])
+        model.to(save_dtype)
+    if hasattr(model.config, "use_cache"):
+        model.config.use_cache = True
     # transformers 5.x 会严格校验 generation_config：LLaMA-2 出厂带 temperature/top_p
     # 但 do_sample=False，直接保存会报 invalid。置 do_sample=True 使其合法（eval 仍显式贪心）。
     if getattr(model, "generation_config", None) is not None:
