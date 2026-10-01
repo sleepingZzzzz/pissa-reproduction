@@ -34,5 +34,13 @@ Thumbs.db
 # ---- 实验追踪 ----
 wandb/
 
-# ---- 论文模板（外部模板，不上库）----
-paper/
+# ---- 论文 LaTeX：源文件与最终 PDF 入库；只忽略编译中间产物 ----
+paper/**/*.aux
+paper/**/*.log
+paper/**/*.out
+paper/**/*.fls
+paper/**/*.fdb_latexmk
+paper/**/*.synctex.gz
+paper/**/*.bbl
+paper/**/*.blg
+paper/out/

@@ -1,0 +1,56 @@
+% SCUT course-report cover page, typeset to match the JMLR/Computer Modern body.
+% Compile with XeLaTeX (needs SimSun for the CJK title marks 《》).
+\documentclass[a4paper,12pt]{article}
+
+\usepackage[top=2.5cm,left=3cm,right=2.5cm,bottom=2.5cm]{geometry}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{graphicx}
+\usepackage{array}
+
+% Latin text uses Latin Modern Roman == Computer Modern (same face as the body).
+\setmainfont{Latin Modern Roman}
+% Only the book-title marks 《 》 need a CJK face.
+\setCJKmainfont{SimSun}
+
+\setlength{\parindent}{0pt}
+\pagestyle{empty}
+
+% A blank underline of a given width (for hand-written fields).
+\newcommand{\blankline}[1]{\underline{\makebox[#1]{}}}
+
+\begin{document}
+
+{\centering
+\vspace*{0.1cm}
+\includegraphics[width=0.60\textwidth]{scut-logo.png}\par
+\vspace{1.3cm}
+{\bfseries\fontsize{22}{28}\selectfont 《Matrix Analysis and Computation》}\par
+\vspace{0.55cm}
+{\bfseries\fontsize{16}{22}\selectfont (2025--2026 the second semester)}\par
+}
+
+\vspace{1.5cm}
+{\bfseries\fontsize{18}{26}\selectfont Title:}\\[0.35cm]
+{\fontsize{15}{22}\selectfont Reproducing PiSSA: Principal Singular Values and
+Singular Vectors Adaptation of Large Language Models --- A Reproduction Study}
+
+\vspace{1.2cm}
+{\bfseries\fontsize{13}{22}\selectfont
+Submitted date:~2026.6.30\hfill Student's name:~\mbox{Xiangyun Xiao}}
+
+\vspace{0.7cm}
+\renewcommand{\arraystretch}{1.5}
+\setlength{\tabcolsep}{6pt}
+\noindent
+\begin{tabular}{|>{\centering\arraybackslash}m{2.4cm}|>{\centering\arraybackslash}m{4.3cm}|>{\centering\arraybackslash}m{2.5cm}|m{4.6cm}|}
+\hline
+\textbf{College} & \textbf{School of Future Technology} & \textbf{Student ID} & ~202364871191 \\
+\hline
+\multicolumn{4}{|l|}{\textbf{Teacher's Comments:}}\\[7.5cm]
+\hline
+\multicolumn{4}{|l|}{\textbf{Score:}\quad\blankline{3cm}}\\[0.4cm]
+\hline
+\end{tabular}
+
+\end{document}
