@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,10 +27,22 @@ class PiSSALinear(nn.Module):
         bias: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
+        if isinstance(r, bool) or not isinstance(r, int) or r <= 0:
+            raise ValueError(f"r 必须是正整数，收到 r={r!r}")
+        alpha_val = float(r) if alpha is None else float(alpha)
+        if not math.isfinite(alpha_val) or alpha_val <= 0:
+            raise ValueError(f"alpha 必须是有限的正数，收到 alpha={alpha!r}")
+        if alpha_val != float(r):
+            # PiSSA 的初始化 W_res = W - B@A 只在 scaling = alpha / r = 1 时保证
+            # W_res + scaling * B@A == W；alpha != r 会在初始化时改变模型输出。
+            raise ValueError(
+                f"PiSSA 要求 alpha == r（scaling = 1），收到 alpha={alpha!r}, r={r}；"
+                "否则初始化会改变原模型输出。"
+            )
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
-        self.alpha = float(alpha) if alpha is not None else float(r)
+        self.alpha = alpha_val
         self.scaling = self.alpha / r
 
         # 冻结的残差权重，注册为 buffer（不参与梯度，但随模型保存/搬运设备）。

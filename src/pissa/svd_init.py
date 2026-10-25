@@ -29,7 +29,10 @@ class PiSSAInit:
     lora_A: torch.Tensor  # (r, in_features)
     lora_B: torch.Tensor  # (out_features, r)
     residual: torch.Tensor  # (out_features, in_features)，冻结
-    singular_values: torch.Tensor  # 全部奇异值（降序），用于画图/分析
+    # 奇异值（降序），用于画图/分析。注意长度取决于 niter：
+    #   niter=None（精确 SVD）：全部 min(out, in) 个奇异值；
+    #   niter 为整数（Fast SVD）：只有前 q=min(min(out, in), r+8) 个近似值，不是完整谱。
+    singular_values: torch.Tensor
 
 
 def pissa_init(
@@ -45,7 +48,8 @@ def pissa_init(
     r:      主成分（适配器）秩。
     niter:  若为 None，用精确 SVD（``torch.linalg.svd``）；
             若为整数，用快速随机化 SVD（``torch.svd_lowrank``，对应论文的 Fast SVD），
-            niter 为幂迭代次数。
+            niter 为幂迭代次数。此时返回的 ``singular_values`` 只含前 q 个近似值，
+            随机性来自 torch 全局随机数，复现时需先固定 seed。
     """
     if weight.ndim != 2:
         raise ValueError(f"weight 必须是二维矩阵，收到 shape={tuple(weight.shape)}")
