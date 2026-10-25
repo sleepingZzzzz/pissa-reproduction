@@ -86,7 +86,8 @@ pip install -r requirements.txt
 >
 > ```bash
 > source /etc/network_turbo          # AutoDL download accelerator (optional)
-> pip install transformers peft datasets accelerate sentencepiece protobuf modelscope addict simplejson sortedcontainers bitsandbytes
+> grep -vE '^(torch|torchvision|triton)==' requirements.txt > /tmp/req_no_torch.txt
+> pip install -r /tmp/req_no_torch.txt     # all other packages are pinned to exact versions
 > python -c "import torch;print(torch.__version__)"   # must still print 2.8.0+cu128
 > ```
 >

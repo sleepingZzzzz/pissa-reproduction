@@ -8,7 +8,7 @@ experiment: m3_qpissa_llama2_7b
 model:
   name: Llama-2-7b
   source: local
-  local_path: data/m1/models/modelscope/Llama-2-7b-ms
+  local_path: data/m1/models/models/modelscope--Llama-2-7b-ms/snapshots/master
 
 # ---- 量化 ----
 quantization:
