@@ -47,21 +47,26 @@ train:
   log_every: 10
   save_merged_dtype: bfloat16
 
-# ---- M2 方法：bf16 全路径（20K 样本、无需梯度检查点、速度优先）----
+# ---- 每种方法的显存策略（96GB 单卡）----
+# 与论文一致：PiSSA/LoRA 的基座与适配器都用 FP32（论文 Sec.5："Float32 computation type for both the base model and the adapter"）。
+# 若 FP32 在某个模型上 OOM，按固定顺序退让（每步只改一个变量，并在结果中标注）：
+#   1) 降 per_device_batch 并等比例增大 grad_accum，保持全局 batch=128；
+#   2) 确认 grad_checkpointing: true；
+#   3) 最后才改 dtype: bfloat16（此时适配器精度也随之改变，PiSSA 与 LoRA 必须用同一 dtype）。
 methods:
   pissa:
-    dtype: bfloat16
+    dtype: float32
     per_device_batch: 8         # LLaMA-3 词表 128k，bs=16 时 logits 张量 ~8.4GB(fp32)，OOM
     grad_accum: 16              # 8 × 16 = 128
     optimizer: adamw
-    grad_checkpointing: false
+    grad_checkpointing: true   # fp32 激活占显存，需开检查点（同 M1）
     learning_rate: null
   lora:
-    dtype: bfloat16
+    dtype: float32
     per_device_batch: 8
     grad_accum: 16
     optimizer: adamw
-    grad_checkpointing: false
+    grad_checkpointing: true   # fp32 激活占显存，需开检查点（同 M1）
     learning_rate: null
   full:
     dtype: bfloat16

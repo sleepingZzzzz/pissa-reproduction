@@ -1,25 +1,42 @@
-# 核心实现与 M0 验证所需依赖。
-# 训练（M1+）与量化（M3）会用到的依赖在到达对应里程碑时再补充固定版本。
-torch>=2.2
-numpy>=1.24
-matplotlib>=3.7
-pyyaml>=6.0
+# PiSSA 复现项目 · Python 依赖（精确版本，保证可复现）
+#
+# 验证环境：Python 3.12.3 / CUDA 12.8 / AutoDL 镜像 "PyTorch 2.8.0"
+# 版本取自二次复现时实际可运行环境的 pip freeze（2026-10-10）。
+#
+# 重要：
+#   - AutoDL 镜像已预装 torch 2.8.0+cu128、torchvision、triton，且与显卡匹配。
+#     在该镜像上请勿重装这三个包（pip 可能换成 CPU 版或不匹配的版本），
+#     只安装下面"其余依赖"部分，装完用
+#         python -c "import torch;print(torch.__version__)"
+#     确认仍为 2.8.0+cu128。
+#   - 在其他机器上从零安装时，torch 需选与本机 CUDA 匹配的 2.8.0 构建
+#     （Blackwell 显卡要求 torch>=2.7 且 cu128）。
+#   - transformers 5.0.0rc2 是预发布版，pip 需加 --pre 或直接指定该版本号。
+#
+# 安装：pip install -r requirements.txt
 
-# M0 与 PEFT 对齐校验 / 奇异值图加载真实模型时需要（可选，缺失会自动跳过）：
-transformers>=4.44
-peft>=0.12
+# ---- 镜像预装（见上方说明）----
+torch==2.8.0
+torchvision==0.23.0
+triton==3.4.0
 
-# MNIST 玩具实验：
-torchvision>=0.17
+# ---- 其余依赖 ----
+numpy==2.3.2
+matplotlib==3.10.5
+PyYAML==6.0.2
+tqdm==4.70.1             # 进度条（src/pissa/inject.py 使用，缺失时退化为无进度条）
 
-# ---- M1 训练（LLaMA-2-7B on MetaMathQA -> GSM8K）----
-# 注意：服务器镜像已自带匹配显卡的 torch（2.8.0+cu128），安装下列包时不要让 pip 改动 torch。
-datasets>=2.20,<4      # 4.0+ 删了 as_dataset(verification_mode=)，与 modelscope MsDataset 不兼容
-accelerate>=0.30
-sentencepiece>=0.2     # LLaMA 分词器
-protobuf>=4.0
-modelscope>=1.15       # 免申请下载 LLaMA-2-7B / 数据集（HF gated/不可达时）
-addict                 # modelscope MsDataset 依赖（主包不自动带）
-simplejson             # 同上
-sortedcontainers       # 同上
-bitsandbytes>=0.43     # Full-FT 的 8bit-Adam（也供 M3 的 NF4 量化）
+# 模型 / 训练
+transformers==5.0.0rc2
+peft==0.21.2             # M0 与 PEFT 对齐校验
+accelerate==1.15.0
+bitsandbytes==0.49.2     # Full-FT 的 8bit-AdamW；M3 的 NF4 量化
+sentencepiece==0.2.2     # LLaMA 分词器
+protobuf==6.31.1
+
+# 数据 / 模型下载
+datasets==3.6.0          # 必须 <4：4.0+ 删了 as_dataset(verification_mode=)，与 modelscope MsDataset 不兼容
+modelscope==1.40.2
+addict==2.4.0            # modelscope MsDataset 依赖（主包不自动带）
+simplejson==4.2.0        # 同上
+sortedcontainers==2.4.0  # 同上
