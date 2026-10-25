@@ -284,6 +284,11 @@ def inject_lora_4bit(model: nn.Module, r: int, alpha, target_modules) -> list[st
         for n, m in model.named_modules()
         if isinstance(m, nn.Linear) and _match(n, tuple(target_modules))
     ]
+    # QLoRA 的基座必须已被 bitsandbytes 量化为 Linear4bit；匹配到普通 nn.Linear 说明
+    # 模型没有按 4-bit 加载，此时静默包装会得到"未量化的 QLoRA"，直接报错。
+    not_4bit = [n for n, m in to_replace if "Linear4bit" not in {c.__name__ for c in type(m).__mro__}]
+    if not_4bit:
+        raise TypeError(f"QLoRA 目标层不是 Linear4bit（模型未按 4-bit 加载？）：{not_4bit[:3]} …共 {len(not_4bit)} 层")
     for name, module in tqdm(to_replace, desc="QLoRA 注入", unit="layer"):
         parent = model.get_submodule(name.rsplit(".", 1)[0]) if "." in name else model
         child = name.rsplit(".", 1)[-1]
@@ -312,9 +317,42 @@ def unwrap_qlora(model: nn.Module, adapter_sd: dict[str, torch.Tensor] | None = 
 # ---------------------------------------------------------------------------
 # 适配器注入：根据方法配置模型可训练性
 # ---------------------------------------------------------------------------
+def count_base_params(model: nn.Module) -> int:
+    """注入适配器之前的"基座参数总量"，用作可训练占比的分母。
+
+    注入后冻结权重被注册成 buffer，model.parameters() 统计不到它们，
+    所以分母必须在注入之前取。4-bit 量化参数（Params4bit）按还原后的元素数计。
+    """
+    total = 0
+    for p in model.parameters():
+        qs = getattr(p, "quant_state", None)
+        total += qs.shape.numel() if qs is not None and hasattr(qs, "shape") else p.numel()
+    return total
+
+
+def check_replace_coverage(replaced: list[str], targets) -> dict[str, int]:
+    """注入后检查覆盖：一层都没替换就报错；config 里的某个目标名没命中则告警。
+
+    返回 {目标名: 命中层数}，写入 metrics，便于事后核对每个模型的实际覆盖范围。
+    """
+    if not replaced:
+        raise RuntimeError(f"没有任何层被替换，请检查 adapter.target_modules={list(targets)}")
+    counts = {t: 0 for t in targets}
+    for name in replaced:
+        leaf = name.rsplit(".", 1)[-1]
+        if leaf in counts:
+            counts[leaf] += 1
+    missing = [t for t, c in counts.items() if c == 0]
+    if missing:
+        print(f"  [warn] 以下 target_modules 一层都没命中：{missing}")
+    return counts
+
+
 def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
     """就地把模型改造为指定方法的可训练形态，返回参数统计。"""
     acfg = cfg["adapter"]
+    base_total = count_base_params(model)  # 必须在注入之前取（见 count_base_params）
+    coverage: dict[str, int] = {}
     if method == "full":
         for p in model.parameters():
             p.requires_grad_(True)
@@ -333,6 +371,7 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
         for n, p in model.named_parameters():
             p.requires_grad_("lora_A" in n or "lora_B" in n)
         n_replaced = len(replaced)
+        coverage = check_replace_coverage(replaced, acfg["target_modules"])
     elif method == "lora":
         for p in model.parameters():
             p.requires_grad_(False)
@@ -342,6 +381,7 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
         for n, p in model.named_parameters():
             p.requires_grad_("lora_A" in n or "lora_B" in n)
         n_replaced = len(replaced)
+        coverage = check_replace_coverage(replaced, acfg["target_modules"])
     elif method == "qpissa":
         # QPiSSA: FP16 加载 → PiSSA SVD → NF4 量化残差
         for p in model.parameters():
@@ -353,6 +393,7 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
         for n, p in model.named_parameters():
             p.requires_grad_("lora_A" in n or "lora_B" in n)
         n_replaced = len(replaced)
+        coverage = check_replace_coverage(replaced, acfg["target_modules"])
     elif method == "qlora":
         # QLoRA: 4-bit 模型上直接添加 LoRA（不 clone 4-bit weight）
         for p in model.parameters():
@@ -363,16 +404,19 @@ def apply_adapter(model: nn.Module, method: str, cfg: dict) -> dict:
         for n, p in model.named_parameters():
             p.requires_grad_("lora_A" in n or "lora_B" in n)
         n_replaced = len(replaced)
+        coverage = check_replace_coverage(replaced, acfg["target_modules"])
     else:
         raise ValueError(f"未知 method={method}")
 
-    trainable, total = trainable_parameters(model)
+    trainable, _ = trainable_parameters(model)  # 第二个返回值只含 Parameter，口径不对，不用
     return {
         "method": method,
         "replaced_modules": n_replaced,
+        "replaced_by_target": coverage,
         "trainable_params": trainable,
-        "total_params": total,
-        "trainable_pct": 100.0 * trainable / max(total, 1),
+        # 分母 = 注入前的基座参数总量（论文口径，例如 LLaMA-2-7B 为 6,738,415,616）。
+        "total_params": base_total,
+        "trainable_pct": 100.0 * trainable / max(base_total, 1),
     }
 
 
@@ -383,9 +427,8 @@ def merge_adapter(model: nn.Module, method: str) -> None:
         merge_pissa(model)  # NFPiSSALinear is a subclass of PiSSALinear
     elif method == "lora":
         merge_lora(model)
-    elif method == "qlora":
-        merge_lora(model)
     # full：无需合并。
+    # qlora：不合并 4-bit 基座，保存路径由 train.py 单独处理（unwrap_qlora），不应调用本函数。
 
 
 # ---------------------------------------------------------------------------

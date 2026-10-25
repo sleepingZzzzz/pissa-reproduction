@@ -154,9 +154,9 @@ def main() -> None:
     if valid:
         by_type_nuc: dict[str, list[float]] = defaultdict(list)
         by_type_fro: dict[str, list[float]] = defaultdict(list)
-        for r in valid:
-            by_type_nuc[r["proj_type"]].append(r["reduction_pct_nuclear"])
-            by_type_fro[r["proj_type"]].append(r["reduction_pct_frobenius"])
+        for rec in valid:  # 不能用 r 作循环变量：会覆盖上面的 r = cfg["adapter"]["r"]
+            by_type_nuc[rec["proj_type"]].append(rec["reduction_pct_nuclear"])
+            by_type_fro[rec["proj_type"]].append(rec["reduction_pct_frobenius"])
 
         # 原文表头顺序
         order = ["q_proj", "k_proj", "v_proj", "o_proj",

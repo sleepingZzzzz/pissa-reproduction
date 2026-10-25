@@ -47,6 +47,14 @@ def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
     return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
 
 
+FINAL_LOSS_POINTS = 10  # final_loss 取最后多少个记录点的均值
+
+
+def _tail_mean(curve: list[dict], key: str, n: int) -> float | None:
+    tail = curve[-n:]
+    return sum(c[key] for c in tail) / len(tail) if tail else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="[M1] 训练 PiSSA/LoRA/Full")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
@@ -110,6 +118,12 @@ def main() -> None:
 
     # ---- 数据 ----
     rows = read_jsonl(abspath(cfg["data"]["train_jsonl"]))
+    # data.num_train_samples 决定实际训练规模（null = 用 jsonl 全部）；--limit 仅用于冒烟，优先级更高。
+    n_cfg = cfg["data"].get("num_train_samples")
+    if n_cfg is not None:
+        if len(rows) < n_cfg:
+            print(f"  [warn] jsonl 只有 {len(rows)} 条，少于 data.num_train_samples={n_cfg}")
+        rows = rows[:n_cfg]
     if args.limit is not None:
         rows = rows[: args.limit]
     max_len = tcfg["max_seq_len"]
@@ -152,6 +166,7 @@ def main() -> None:
     opt_step = 0
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
+    window_loss = torch.zeros((), device=device)  # 当前梯度累积窗口内的平均 loss（见下）
     pbar = tqdm(total=total_opt_steps, desc=f"训练[{args.method}]", unit="step")
     for epoch in range(tcfg["num_epochs"]):
         for micro_i, batch in enumerate(loader):
@@ -168,6 +183,8 @@ def main() -> None:
                 )
                 loss = out.loss / grad_accum
             loss.backward()
+            # loss 已除以 grad_accum，累加 grad_accum 个 micro-batch 后即为整个窗口的平均 loss。
+            window_loss += loss.detach().float()
 
             if (micro_i + 1) % grad_accum == 0:
                 lr_now = cosine_lr(opt_step, total_opt_steps, warmup_steps, base_lr)
@@ -177,11 +194,15 @@ def main() -> None:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 opt_step += 1
-                cur = float(loss.item()) * grad_accum
+                cur = float(window_loss.item())  # 整个累积窗口的平均 loss
+                last_micro = float(loss.item()) * grad_accum  # 旧口径：只取窗口内最后一个 micro-batch
+                window_loss.zero_()
                 pbar.update(1)
                 pbar.set_postfix(loss=f"{cur:.4f}", lr=f"{lr_now:.2e}")
                 if opt_step % tcfg["log_every"] == 0 or opt_step == total_opt_steps:
-                    loss_curve.append({"step": opt_step, "loss": cur, "lr": lr_now})
+                    loss_curve.append(
+                        {"step": opt_step, "loss": cur, "loss_last_micro": last_micro, "lr": lr_now}
+                    )
 
     pbar.close()
 
@@ -233,7 +254,12 @@ def main() -> None:
         "param_stats": stats,
         "results": {
             "loss_curve": loss_curve,
-            "final_loss": loss_curve[-1]["loss"] if loss_curve else None,
+            # final_loss = 最后 N 个记录点（每点是一个完整梯度累积窗口的平均）的均值，比单点稳健。
+            "final_loss": _tail_mean(loss_curve, "loss", FINAL_LOSS_POINTS),
+            "final_loss_window_points": min(len(loss_curve), FINAL_LOSS_POINTS),
+            "final_loss_last_step": loss_curve[-1]["loss"] if loss_curve else None,
+            # 旧口径（第一轮的 final_loss）：最后一个 micro-batch 的单点值，噪声大，仅供对照。
+            "final_loss_last_micro": loss_curve[-1]["loss_last_micro"] if loss_curve else None,
             "wall_time_sec": time.time() - t0,
         },
     }

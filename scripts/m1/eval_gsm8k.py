@@ -108,6 +108,9 @@ def main() -> None:
         with torch.no_grad():
             gen = model.generate(
                 input_ids=enc["input_ids"],
+                # 必须显式传 attention_mask：pad_token 被设成 eos 时 transformers 无法从
+                # input_ids 推断掩码，会把左填充当作正文读入。
+                attention_mask=enc["attention_mask"],
                 max_new_tokens=ecfg["max_new_tokens"],
                 do_sample=False,
                 pad_token_id=tokenizer.pad_token_id,
