@@ -14,7 +14,7 @@ forward:  y = x (W_res + B A)
 
 | Milestone | Content | Compute |
 |---|---|---|
-| **M0** ✅ | From-scratch SVD initialization + correctness verification (reconstruction identity, alignment with HF PEFT, Eckart–Young property, Fig.3 singular spectrum, Fig.2a MNIST toy convergence) | Local / free |
+| **M0** | Initialization correctness checks, controlled PEFT alignment, paired MNIST mechanism experiment, and weight/residual spectra and distributions; rerun the revised protocol before making new result claims | Local / free |
 | **M1** ✅ | Single model **LLaMA-2-7B** (paper-aligned), PiSSA vs LoRA (±Full-FT), proving faster/better convergence (MetaMathQA → GSM8K), validated against the paper's numbers | RTX PRO 6000 96GB |
 | **M2** ✅ | Repeat on **newer / cross-family models** (ChatGLM3-6B, Qwen2.5-7B, Llama3-8B, Baichuan2-7B) to test generality beyond the paper's models | RTX PRO 6000 96GB |
 | **M3** ✅ | Quantized QPiSSA vs QLoRA: NF4 error-reduction table (Table 4) + 4-bit training convergence | RTX PRO 6000 96GB |
@@ -96,19 +96,71 @@ pip install -r requirements.txt
 ## Running M0
 
 ```bash
-# 1. Verify initialization correctness (reconstruction identity + Eckart–Young + HF PEFT alignment)
-python scripts/m0/verify_init.py --in-features 1024 --out-features 1024 --r 64
+# 1. Mathematical checks + Fast quality + exact/Fast PEFT and LoRA alignment
+python scripts/m0/verify_init.py --in-features 1024 --out-features 1024 --r 64 --seeds 0 1 2 --niters 2 4 --device cpu
 
-# 2. Singular-value spectrum (Fig.3); reads a single real layer via ModelScope by default, add --random for offline
-python scripts/m0/plot_singular.py
+# 2. Paired mechanism experiment: retrain one shared base per seed
+python scripts/m0/mnist_toy.py --epochs 3 --ft-steps 300 --seeds 0 1 2 --eval-every 100 --device cuda
 
-# 3. MNIST toy convergence comparison (Fig.2a)
-python scripts/m0/mnist_toy.py --epochs 3 --ft-steps 300
+# 3a. Paper-sample path: set this to an existing local safetensors directory
+python scripts/m0/plot_singular.py --local-path "PATH_TO_LLAMA2_SNAPSHOT" --layer model.layers.0.self_attn.q_proj --r 128
+
+# 3b. Alternative real-weight demonstration (network required; not the paper sample)
+python scripts/m0/plot_singular.py --source auto
 ```
 
-Artifacts are saved to `results/m0/exp1/` (`figures/*.png` and `metrics/*.json`).
+Use the project's Python environment (PEFT 0.18.1); on this Windows checkout it is
+`D:\app\anaconda\envs\PiSSA\python.exe`. `--device cpu` also supports the toy run;
+CUDA is optional. No LLM is downloaded for PEFT checks: a tiny random Llama is
+constructed locally. The toy run downloads official MNIST if it is absent from
+`data/mnist`; this cache does not move with `--output`.
 
-**M0 result**: our from-scratch PiSSA matches HF PEFT element-wise (zero relative error), satisfies the SVD/reconstruction properties, and reproduces PiSSA's faster-than-LoRA convergence on the toy task — implementation verified.
+All three scripts interpret `--output DIR` as an experiment root containing
+`metrics/` and `figures/`. The default remains `results/m0/exp1/` and overwrites
+its previous results. Use a different output directory for smoke checks.
+Reports start as `running`, update incrementally, and use same-directory atomic
+JSON replacement. Exit codes: `0` complete/pass, `1` failure/error, `2` partial
+(including `--skip-peft`), and `64` invalid arguments. A leftover `running` report
+means incomplete, not a diagnosed cause. Saving failures are errors, not passes.
+
+The revised protocol distinguishes arithmetic preservation from principal
+selection using known gapped spectra, independent FP64 references, and
+deliberately incorrect test cases. Fast SVD uses predeclared approximation
+safety bounds (residual Frobenius ratio <= 1.5 where the optimal tail is nonzero)
+and reports actual ratios, not a universal near-optimality guarantee. Near-zero
+tails use scale-aware absolute bounds; near-degenerate directions are diagnostic,
+not an automatic failure. The shared initializer still computes in FP32, and its
+default Fast solver dimension remains `min(k, r+8)`; reference alignment explicitly
+uses `q=r`. This implementation currently accepts only `alpha=r` for PiSSA; this
+is an implementation restriction, not a mathematical limitation of PiSSA.
+
+MNIST uses three Linear layers and two hidden ReLUs. Each seed retrains a base
+and compares `fc_full` (fc weight+bias), `full_ft` (all model weight/bias), LoRA,
+and PiSSA (fc adapters only, frozen bias), with paired fine-tuning batches.
+LoRA A now uses Gaussian std `1/r`, B zero. Historical single-seed results used
+a different initialization/data-order protocol and must not be mixed with new
+results. The official even-class test split is evaluated at predeclared steps;
+it must not select hyperparameters, seeds, or checkpoints. Per-seed metrics and
+paired differences are primary; n=3 summaries are descriptive, not significance
+claims. This is a mechanism experiment, not a reproduction of Fig.2(a)'s 2D path.
+
+The spectrum script plots W/residual spectra and element distributions with
+shared bins (Fig.3(a)(b)(c)(f)-style, no quantization). Real-source or target-key
+failures stop by default. `--random` is an explicit synthetic demonstration;
+`--allow-random-fallback` explicitly permits a labeled fallback after remote
+failure. Local loads never silently switch sources. Network reads require valid
+HTTP 206 byte ranges, bounded headers, consistent available ETags, and finite
+retries. Reports retain actual source/key/shard/original dtype and HTTP metadata.
+
+Run offline CPU tests with `python -m pytest tests -q`. PEFT tests skip explicitly
+when imports are missing/incompatible. Skipped tests are not alignment evidence.
+Seeds do not guarantee bitwise equality across hardware or dependency versions.
+
+**Revised M0 status:** implementation smoke results do not replace a full run of
+this protocol. No PiSSA performance ordering is a pass criterion. JSON schema v2
+stores per-seed toy results under `results.runs`; do not run the old
+`scripts/plot/regenerate_figures.py` on it. Its compatibility and the paper draft
+are deferred; this stage does not rewrite M1–M3 figures or `paper/figures/`.
 
 ## Running M1
 
