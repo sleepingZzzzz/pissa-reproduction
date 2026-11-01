@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "experiment": "M0/plot_singular",
-  "timestamp": "2026-11-01T11:26:40.332104+00:00",
+  "timestamp": "2026-11-01T13:43:56.597339+00:00",
   "status": "passed",
   "exit_code": 0,
   "config": {
@@ -18,12 +18,12 @@
     "retries": 2,
     "device": "cpu",
     "threads": 4,
-    "output": "D:\\project\\Github\\pissa-reproduction\\results\\m0\\exp1",
+    "output": "D:\\project\\pissa-m0-supplement\\main",
     "weight_shape": [
       4096,
       2048
     ],
-    "figure": "D:\\project\\Github\\pissa-reproduction\\results\\m0\\exp1\\figures\\singular_values.png"
+    "figure": "D:\\project\\pissa-m0-supplement\\main\\figures\\singular_values.png"
   },
   "environment": {
     "python": "3.12.16 | packaged by Anaconda, Inc. | (main, Oct 26 2026, 20:13:05) [MSC v.1942 64 bit (AMD64)]",
@@ -47,11 +47,13 @@
     "command": [
       "scripts/m0/plot_singular.py",
       "--source",
-      "auto"
+      "auto",
+      "--output",
+      "D:\\project\\pissa-m0-supplement\\main"
     ],
     "git": {
-      "commit": "f8394dd393d920bfa01cb81d5234f4dc1462cff9",
-      "dirty": true,
+      "commit": "736ea4e31dde12cee656f7651b1177dfe5a2bff9",
+      "dirty": false,
       "reason": null
     }
   },
@@ -4372,10 +4374,10 @@
     }
   },
   "timings_seconds": {
-    "load_weight": 6.242345699982252,
-    "decomposition_and_residual_spectrum": 1.442185799998697,
-    "plot": 0.4660745000001043,
-    "total": 8.43436539999675
+    "load_weight": 2.3082583000068553,
+    "decomposition_and_residual_spectrum": 1.7219422000343911,
+    "plot": 1.8449137000134215,
+    "total": 6.1406679000356235
   },
   "provenance": {
     "original_dtype": "torch.bfloat16",
