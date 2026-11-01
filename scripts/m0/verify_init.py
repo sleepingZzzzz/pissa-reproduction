@@ -3,6 +3,11 @@
 Reconstruction tests wiring, not selection. Analytic fixtures test selection;
 randomized quality and reference agreement are different claims. Small shared
 report/CLI helpers stay here to respect the M0 file whitelist.
+
+Supplement: niter=0 sensitivity rows are diagnostics, not new acceptance
+criteria. The 1.50 safety bound is retained after observing prior good-setting
+ratios up to about 1.034; retaining it is not blind calibration. PEFT checks
+include both the requested rank and a fixed r/k=16/256 regime.
 """
 from __future__ import annotations
 
@@ -290,6 +295,30 @@ def check_fast_quality(in_f, out_f, r, niters, seeds, device="cpu"):
         "interpretation": "predeclared safety bounds; report actual quality, not universal near-optimality"}
 
 
+def check_fast_sensitivity(in_f, out_f, r, seeds, device="cpu"):
+    """Predeclared no-power-iteration probes on the same matrices/seeds.
+
+    q cannot be smaller than r: q=r is the smaller valid solver setting.
+    niter=0 is intended to reduce quality, not guaranteed to do so per sample.
+    Missing the old quality bound here is a diagnostic observation, not failure.
+    """
+    result = check_fast_quality(in_f, out_f, r, [0], seeds, device)
+    rows = []
+    for sample in result["samples"]:
+        row = dict(sample)
+        row["within_existing_limit"] = row.pop("passed")
+        rows.append(row)
+    return {"passed": all(torch.isfinite(torch.tensor(x["residual_frobenius"])) for x in rows),
+        "diagnostic_only": True, "quality_outcomes_affect_all_pass": False,
+        "retention_informed_by_prior_results": True,
+        "threshold_policy": "retain 1.50 unchanged; prior good-run worst ratio about 1.034",
+        "calibration_disclosure": "retention decision is informed by already observed good settings; not blind validation",
+        "settings": {"niters": [0], "q": sorted({r, min(min(in_f, out_f), r+8)}),
+                     "matrix_seed": 21, "seeds": list(seeds)},
+        "samples": rows,
+        "interpretation": "report every probe; niter=0 need not cross 1.50; no thresholds or earlier criteria changed"}
+
+
 def import_peft():
     try:
         from peft import LoraConfig, get_peft_model
@@ -309,19 +338,22 @@ def check_against_peft(r, niter=None, device="cpu"):
         return skipped
     LoraConfig, get_peft_model, LlamaConfig, LlamaForCausalLM, lora_layer = imports
     size = max(32, ((r+15)//8)*8)  # >= r+8; four heads with even head_dim
+    cases = [(regime, width, rank, kind)
+        for regime, width, rank in (("requested_rank", size, r), ("low_rank_fraction", 256, 16))
+        for kind in ("gapped", "gaussian")]
     samples = []
     with seeded(0, device):
-        for kind in ("gapped", "gaussian"):
+        for regime, size, rank, kind in cases:
             model = LlamaForCausalLM(LlamaConfig(hidden_size=size, intermediate_size=size*2,
                 num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=4, vocab_size=32)).to(device=device, dtype=torch.float32)
             name = "model.layers.0.self_attn.q_proj"
             if kind == "gapped":
                 with torch.no_grad():
-                    model.get_submodule(name).weight.copy_(known_spectrum(size, size, r)[0])
+                    model.get_submodule(name).weight.copy_(known_spectrum(size, size, rank)[0])
             w = model.get_submodule(name).weight.detach().clone()
             with seeded(17, device):
-                ours = pissa_init(w, r, niter=niter, **({"q": r} if niter is not None else {}))
-            config = LoraConfig(r=r, lora_alpha=r, target_modules=["q_proj"], lora_dropout=0.,
+                ours = pissa_init(w, rank, niter=niter, **({"q": rank} if niter is not None else {}))
+            config = LoraConfig(r=rank, lora_alpha=rank, target_modules=["q_proj"], lora_dropout=0.,
                 init_lora_weights="pissa" if niter is None else f"pissa_niter_{niter}")
             original = lora_layer.svd_lowrank
             def controlled(*args, **kwargs):
@@ -337,8 +369,9 @@ def check_against_peft(r, niter=None, device="cpu"):
             with torch.no_grad():
                 py = target(x)
                 oy = F.linear(x, ours.residual)+F.linear(F.linear(x, ours.lora_A), ours.lora_B)
-            samples.append({"spectrum": kind, "shape": [size, size], "r": r,
-                "q": r if niter is not None else None,
+            samples.append({"spectrum": kind, "shape": [size, size], "r": rank,
+                "regime": regime, "r_over_k": rank/size,
+                "q": rank if niter is not None else None,
                 "passed": all([close(od, pd), close(ours.residual, pr), close(ours.residual+od, pr+pd), close(oy, py)]),
                 "BA_rel_err": relative(od, pd), "residual_rel_err": relative(ours.residual, pr),
                 "merged_rel_err": relative(ours.residual+od, pr+pd), "forward_rel_err": relative(oy, py)})
@@ -394,6 +427,7 @@ def main(argv=None):
         "reconstruction_and_forward": lambda: check_reconstruction(args.in_features, args.out_features, args.r, args.niter, args.device),
         "svd_property_eckart_young": lambda: check_svd_property(args.in_features, args.out_features, args.r, args.device),
         "fast_quality": lambda: check_fast_quality(args.in_features, args.out_features, args.r, args.niters, args.seeds, args.device),
+        "fast_sensitivity": lambda: check_fast_sensitivity(args.in_features, args.out_features, args.r, args.seeds, args.device),
         "layer_contracts": lambda: check_contracts(args.device)}
     skipped = lambda: {"skipped": True, "reason": "--skip-peft", "category": "user_requested"}
     checks["peft_exact"] = skipped if args.skip_peft else lambda: check_against_peft(args.r, device=args.device)

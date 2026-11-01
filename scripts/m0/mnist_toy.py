@@ -2,10 +2,18 @@
 
 Three Linear layers, two hidden ReLUs. Each seed retrains one shared base;
 four paired methods see identical batches. Test data never selects settings.
+
+--scan is an exploratory, validation-only one-factor diagnostic. It reserves
+10% of even training samples with a separate fixed split seed and never loads
+the official test set. Main mode keeps all even training data and its original
+random streams. Per-step displacements concern effective FC weights, including
+for full_ft (not its enc/head). Displacement alone does not establish causality.
 """
 from __future__ import annotations
 
 import copy
+import csv
+import hashlib
 import importlib.metadata
 import math
 from pathlib import Path
@@ -98,6 +106,45 @@ def get_loaders(batch, *, seed=0, train_dataset=None, test_dataset=None):
     return {"odd": make_loader(subset(train_dataset, 1), batch, seed, True),
             "even": make_loader(subset(train_dataset, 0), batch, seed, True),
             "test": make_loader(subset(test_dataset, 0), batch, seed, False)}
+
+
+def get_scan_loaders(batch, *, seed=0, split_seed=20261101, validation_fraction=.1,
+                     train_dataset=None):
+    """Load training data only; split without consuming any global RNG stream."""
+    if not 0 < validation_fraction < 1:
+        raise ValueError("validation_fraction must be between zero and one")
+    if train_dataset is None:
+        from torchvision import datasets, transforms
+        transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((.1307,), (.3081,))])
+        train_dataset = datasets.MNIST(str(DATA_DIR), train=True, download=True, transform=transform)
+    labels = torch.as_tensor(train_dataset.targets)
+    even = (labels % 2 == 0).nonzero(as_tuple=True)[0].tolist()
+    odd = (labels % 2 == 1).nonzero(as_tuple=True)[0].tolist()
+    count = int(len(even)*validation_fraction)
+    if not odd or not 0 < count < len(even):
+        raise ValueError("split must have nonempty odd, even-train and validation subsets")
+    order = torch.randperm(len(even), generator=torch.Generator().manual_seed(split_seed)).tolist()
+    validation_ids = sorted(even[i] for i in order[:count])
+    training_ids = sorted(even[i] for i in order[count:])
+    split = {"seed": split_seed, "fraction": validation_fraction,
+        "training_samples": len(training_ids), "validation_samples": len(validation_ids),
+        "validation_indices": validation_ids,
+        "training_indices_sha256": hashlib.sha256(",".join(map(str, training_ids)).encode()).hexdigest(),
+        "role": "even training holdout; official test never loaded"}
+    return {"odd": make_loader(Subset(train_dataset, odd), batch, seed, True),
+        "even": make_loader(Subset(train_dataset, training_ids), batch, seed, True),
+        "validation": make_loader(Subset(train_dataset, validation_ids), batch, split_seed, False),
+        "split": split}
+
+
+@torch.no_grad()
+def effective_fc_weight(model):
+    """Actual linear map in FC: base + scaled BA, never raw adapter factors."""
+    if isinstance(model.fc, PiSSALinear):
+        return model.fc.merged_weight().detach()
+    if isinstance(model.fc, LoRALinear):
+        return (model.fc.weight + model.fc.scaling*(model.fc.lora_B @ model.fc.lora_A)).detach()
+    return model.fc.weight.detach()
 
 
 def validate_initialization(base, model, method, r, probe):
@@ -193,12 +240,20 @@ def pretrain(model, loader, epochs, device):
     return {"epoch_online_loss": losses, "optimizer_steps": steps, "samples_seen": samples}
 
 
-def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_window):
+def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_window, *,
+             record_displacement=True, evaluation_steps=None, evaluation_role=None):
     before = frozen_state(model)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
     stream, losses, evaluations, sizes = batch_stream(loader), [], [], []
+    displacements = []
+    previous = effective_fc_weight(model).clone() if record_displacement else None
+    def evaluation(step):
+        result = {"step": step, **evaluate(model, eval_loader, device)}
+        if evaluation_role is not None:
+            result["role"] = evaluation_role
+        return result
     tick = time.perf_counter()
-    evaluations.append({"step": 0, **evaluate(model, eval_loader, device)})
+    evaluations.append(evaluation(0))
     eval_seconds = time.perf_counter()-tick
     started = time.perf_counter()
     model.train()
@@ -211,11 +266,17 @@ def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_win
             raise ValueError("non-finite fine-tuning loss")
         loss.backward()
         opt.step()
+        if record_displacement:
+            current = effective_fc_weight(model)
+            displacements.append(float(torch.linalg.vector_norm(current-previous)))
+            previous = current.clone()
         losses.append(float(loss.detach()))
         sizes.append(len(y))
-        if step % eval_every == 0 or step == steps:
+        should_evaluate = (step in evaluation_steps or step == steps) if evaluation_steps is not None else (
+            step % eval_every == 0 or step == steps)
+        if should_evaluate:
             tick = time.perf_counter()
-            evaluations.append({"step": step, **evaluate(model, eval_loader, device)})
+            evaluations.append(evaluation(step))
             eval_seconds += time.perf_counter()-tick
     validate_frozen(model, before)
     n = min(tail_window, steps)
@@ -223,6 +284,9 @@ def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_win
         "tail_online_mean": sum(a*b for a, b in zip(losses[-n:], sizes[-n:]))/sum(sizes[-n:]),
         "tail_window": n, "evaluations": evaluations, "frozen_unchanged": True,
         "samples_seen": sum(sizes), "evaluation_seconds": eval_seconds,
+        "step_displacements": displacements,
+        "displacement_scope": "effective fc.weight only; full_ft enc/head and all biases excluded",
+        "displacement_metric": "Frobenius norm of post-update minus pre-update effective weight",
         "loop_seconds": time.perf_counter()-started,
         "loss_semantics": "online pre-update batch loss; tail mixes parameter states"}
 
@@ -278,6 +342,167 @@ def paired_summary(runs):
         "interpretation": "descriptive only; no statistical significance or universal ordering claim"}
 
 
+def scan_grid(lrs, ranks, base_r, base_lr):
+    """One-factor grid; reuse the shared lr=base_lr/r=base_r cells."""
+    cells = {}
+    for lr in lrs:
+        for method in METHODS:
+            cells[(method, lr, base_r)] = {"method": method, "lr": lr, "r": base_r, "axes": ["lr"]}
+    for r in ranks:
+        for method in ("lora", "pissa"):
+            key = (method, base_lr, r)
+            if key in cells:
+                cells[key]["axes"].append("rank")
+            else:
+                cells[key] = {"method": method, "lr": base_lr, "r": r, "axes": ["rank"]}
+    return list(cells.values())
+
+
+def scan_protocol(args):
+    """Written to disk before data loading/training; never revised by outcomes."""
+    return {"diagnostic_only": True, "origin": "exploratory follow-up to already observed main results",
+        "evaluation_split": "training_even_validation_only", "official_test_loaded": False,
+        "split_seed": args.split_seed, "validation_fraction": args.validation_fraction,
+        "lrs": args.scan_lrs, "ranks": args.scan_ranks, "base_lr": args.lr, "base_r": args.r,
+        "checkpoints": args.scan_checkpoints, "steps": args.ft_steps, "seeds": args.seeds,
+        "paired_rule": "same seed: one pretrained base and identical fresh finetune generator per cell",
+        "comparisons": ["PiSSA minus fc_full validation loss per seed at each lr/checkpoint",
+            "PiSSA minus LoRA and fixed-lr fc_full reference per seed at each rank/checkpoint",
+            "count negative paired differences; report complete cells, not only winners",
+            "adjacent changes of mean signed gap as lr/rank increases"],
+        "best_lr_rule": "per method minimize across-seed mean final validation loss; ties use smaller lr",
+        "best_lr_reporting": "use that single selected lr for every seed; report paired gaps at both checkpoints",
+        "interpretation": "same-lr and method-specific validation-selected best-lr comparisons answer different questions; selected validation scores are not independent test estimates",
+        "causal_limit": "gap changes and effective-FC displacements identify candidate explanations, not proven mechanisms",
+        "rank_limit": "full-rank adapters still have different parameterization/count from dense FC; no inference about paper Fig.2(a)"}
+
+
+def scan_table(runs, checkpoints):
+    rows = []
+    for run in runs:
+        for cell in run["experiments"]:
+            result = cell["result"]
+            for evaluation in result["evaluations"]:
+                step = evaluation["step"]
+                if step not in checkpoints:
+                    continue
+                movement = result["step_displacements"][:step]
+                rows.append({"seed": run["seed"], "axes": "+".join(cell["axes"]),
+                    "method": cell["method"], "lr": cell["lr"], "r": cell["r"], "step": step,
+                    "validation_loss": evaluation["loss"], "validation_samples": evaluation["samples"],
+                    "trainable_parameters": result["trainable_parameters"],
+                    "fc_step_displacement": movement[-1],
+                    "fc_mean_step_displacement": statistics.mean(movement)})
+    return rows
+
+
+def scan_comparisons(table, protocol):
+    index = {(x["seed"], x["method"], x["lr"], x["r"], x["step"]): x for x in table}
+    seeds, checkpoints = protocol["seeds"], protocol["checkpoints"]
+    base_r, base_lr = protocol["base_r"], protocol["base_lr"]
+    def paired(method_a, lr_a, r_a, method_b, lr_b, r_b, step):
+        differences = [{"seed": seed, "difference": index[(seed, method_a, lr_a, r_a, step)]["validation_loss"]-
+                        index[(seed, method_b, lr_b, r_b, step)]["validation_loss"]} for seed in seeds]
+        return {"paired_differences": differences, "a_lower_loss_count": sum(x["difference"]<0 for x in differences),
+                "n": len(seeds), "mean_signed_gap": statistics.mean(x["difference"] for x in differences)}
+    same_lr = [{"lr": lr, "step": step, **paired("pissa", lr, base_r, "fc_full", lr, base_r, step)}
+               for lr in protocol["lrs"] for step in checkpoints]
+    rank_rows = [{"r": r, "step": step,
+        "pissa_minus_fc_full": paired("pissa", base_lr, r, "fc_full", base_lr, base_r, step),
+        "pissa_minus_lora": paired("pissa", base_lr, r, "lora", base_lr, r, step)}
+        for r in protocol["ranks"] for step in checkpoints]
+    best = {}
+    for method in METHODS:
+        candidates = []
+        for lr in protocol["lrs"]:
+            values = [index[(s, method, lr, base_r, checkpoints[-1])]["validation_loss"] for s in seeds]
+            candidates.append((statistics.mean(values), lr, values))
+        score, lr, values = min(candidates)
+        best[method] = {"lr": lr, "mean_final_validation_loss": score,
+                        "per_seed_final_validation_loss": dict(zip(map(str, seeds), values))}
+    selected = [{"step": step, "pissa_lr": best["pissa"]["lr"], "fc_full_lr": best["fc_full"]["lr"],
+        **paired("pissa", best["pissa"]["lr"], base_r, "fc_full", best["fc_full"]["lr"], base_r, step)}
+        for step in checkpoints]
+    trends = []
+    for step in checkpoints:
+        for axis, series in (("lr", sorted((x["lr"], x["mean_signed_gap"]) for x in same_lr if x["step"]==step)),
+                             ("rank", sorted((x["r"], x["pissa_minus_fc_full"]["mean_signed_gap"])
+                                             for x in rank_rows if x["step"]==step))):
+            for (before, gap_before), (after, gap_after) in zip(series, series[1:]):
+                change = gap_after-gap_before
+                trends.append({"axis": axis, "step": step, "from": before, "to": after,
+                    "change_in_mean_signed_gap": change,
+                    "direction": "increased" if change>0 else "decreased" if change<0 else "unchanged"})
+    return {"same_lr_pissa_minus_fc_full": same_lr, "rank_comparisons": rank_rows,
+        "best_lr_by_method": best, "selected_lr_pissa_minus_fc_full": selected,
+        "signed_gap_trends": trends,
+        "interpretation": "descriptive, validation-selected, exploratory; no statistical significance or causal claim"}
+
+
+def run_scan(args, datasets=None):
+    config = {**vars(args), "output": str(args.output.resolve()), "data_dir": str(DATA_DIR),
+        "mode": "diagnostic_scan", "data_source": "official_MNIST_train_only" if datasets is None else "injected_test_fixture",
+        "storage_dtype": "torch.float32", "main_experiment_changed": False}
+    path = args.output / "metrics/mnist_scan.json"
+    started = time.perf_counter()
+    report = new_report("M0/mnist_scan", config, args.device)
+    report["protocol"] = scan_protocol(args)
+    report["results"] = {"runs": []}
+    atomic_json(path, report)  # fixed comparison/selection rules precede every run
+    try:
+        train = datasets[0] if datasets is not None else None
+        grid = scan_grid(args.scan_lrs, args.scan_ranks, args.r, args.lr)
+        report["config"]["grid"] = grid
+        for seed in args.seeds:
+            bundle = seed_bundle(seed)
+            loaders = get_scan_loaders(args.batch, seed=bundle["pretrain_data"],
+                split_seed=args.split_seed, validation_fraction=args.validation_fraction, train_dataset=train)
+            train = loaders["even"].dataset.dataset
+            with seeded(bundle["base"], args.device):
+                base = MLP(args.hidden).to(args.device)
+            tick = time.perf_counter()
+            pretraining = pretrain(base, loaders["odd"], args.epochs, args.device)
+            run = {"seed": seed, "seed_bundle": bundle, "split": loaders["split"],
+                "pretraining": pretraining, "pretrain_seconds": time.perf_counter()-tick, "experiments": []}
+            report["results"]["runs"].append(run)
+            probe = torch.stack([loaders["even"].dataset[i][0] for i in range(min(8, len(loaders["even"].dataset)))]).to(args.device)
+            atomic_json(path, report)
+            for cell in grid:
+                tick = time.perf_counter()
+                with seeded(bundle["adapter"], args.device):
+                    model, info = prepare_method(base, cell["method"], cell["r"], probe)
+                loader = make_loader(loaders["even"].dataset, args.batch, bundle["finetune_data"], True)
+                result = finetune(model, loader, args.ft_steps, cell["lr"], args.device,
+                    loaders["validation"], args.eval_every, args.tail_window,
+                    evaluation_steps=args.scan_checkpoints, evaluation_role="even training validation; official test not loaded")
+                result.update(info, seconds=time.perf_counter()-tick)
+                run["experiments"].append({**cell, "result": result})
+                print(f"scan seed={seed} {cell['method']} lr={cell['lr']:g} r={cell['r']}: validation loss={result['evaluations'][-1]['loss']:.5f}", flush=True)
+                atomic_json(path, report)
+                del model
+            del base
+        table = scan_table(report["results"]["runs"], args.scan_checkpoints)
+        report["results"]["table"] = table
+        report["results"]["comparisons"] = scan_comparisons(table, report["protocol"])
+        csv_path = args.output / "metrics/mnist_scan.csv"
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(table[0]))
+            writer.writeheader()
+            writer.writerows(table)
+        report["config"]["table_csv"] = str(csv_path.resolve())
+        print("seed,method,lr,r,step,validation_loss,fc_step_displacement", flush=True)
+        for row in table:
+            print(f"{row['seed']},{row['method']},{row['lr']:g},{row['r']},{row['step']},{row['validation_loss']:.8f},{row['fc_step_displacement']:.8g}", flush=True)
+        code = finish_report(report, path, "passed", 0, started)
+        print(f"Diagnostic scan completed: {path.resolve()}\nFull table: {csv_path.resolve()}", flush=True)
+        return code
+    except Exception as exc:
+        report["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        finish_report(report, path, "error", 1, started)
+        print(f"MNIST scan error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv=None, *, datasets=None):
     parser = ArgumentParser64(description="Paired odd-to-even MNIST mechanism experiment")
     parser.add_argument("--epochs", type=int, default=3)
@@ -292,12 +517,32 @@ def main(argv=None, *, datasets=None):
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--scan", action="store_true", help="validation-only one-factor diagnostic, separate output required")
+    parser.add_argument("--scan-lrs", nargs="+", type=float, default=[3e-4, 1e-3, 3e-3])
+    parser.add_argument("--scan-ranks", nargs="+", type=int, default=[8, 32, 128, 256])
+    parser.add_argument("--scan-checkpoints", nargs=2, type=int, default=[50, 300])
+    parser.add_argument("--split-seed", type=int, default=20261101)
+    parser.add_argument("--validation-fraction", type=float, default=.1)
     args = parser.parse_args(argv)
     if min(args.epochs, args.ft_steps, args.r, args.hidden, args.batch, args.eval_every, args.tail_window, args.threads)<=0:
         parser.error("counts must be positive")
     if args.r>args.hidden or not math.isfinite(args.lr) or args.lr<=0 or len(set(args.seeds))!=len(args.seeds):
         parser.error("require r <= hidden, finite positive lr and distinct seeds")
     torch.set_num_threads(args.threads)
+    if args.scan:
+        if args.output.resolve() == DEFAULT_OUTPUT.resolve():
+            parser.error("--scan requires a separate --output; formal results must not be overwritten")
+        if not 0 < args.validation_fraction < 1:
+            parser.error("validation fraction must lie in (0,1)")
+        if any(not math.isfinite(lr) or lr<=0 for lr in args.scan_lrs) or args.lr not in args.scan_lrs:
+            parser.error("scan learning rates must be positive/finite and include base --lr")
+        if any(r<=0 or r>args.hidden for r in args.scan_ranks) or args.r not in args.scan_ranks:
+            parser.error("scan ranks must be within hidden size and include base --r")
+        if len(set(args.scan_lrs))!=len(args.scan_lrs) or len(set(args.scan_ranks))!=len(args.scan_ranks):
+            parser.error("scan values must be distinct")
+        if not 0 < args.scan_checkpoints[0] < args.scan_checkpoints[1] == args.ft_steps:
+            parser.error("scan checkpoints must increase and end at --ft-steps")
+        return run_scan(args, datasets)
     config = {**vars(args), "output": str(args.output.resolve()), "data_dir": str(DATA_DIR),
         "data_source": "official_MNIST" if datasets is None else "injected_test_fixture",
         "methods": list(METHODS), "lora_A_std": 1/args.r, "storage_dtype": "torch.float32",
