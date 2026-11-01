@@ -33,6 +33,7 @@ class PiSSALinear(nn.Module):
         if not math.isfinite(alpha_val) or alpha_val <= 0:
             raise ValueError(f"alpha 必须是有限的正数，收到 alpha={alpha!r}")
         if alpha_val != float(r):
+            # 这是本实现的范围限制；一般 PiSSA 可补偿 scaling，但本复现不扩展该分支。
             # PiSSA 的初始化 W_res = W - B@A 只在 scaling = alpha / r = 1 时保证
             # W_res + scaling * B@A == W；alpha != r 会在初始化时改变模型输出。
             raise ValueError(
@@ -65,7 +66,7 @@ class PiSSALinear(nn.Module):
         alpha: float | None = None,
         niter: int | None = None,
     ) -> "PiSSALinear":
-        """由一个已有 nn.Linear 构造 PiSSALinear，并完成 PiSSA 初始化。"""
+        """完成初始化并保留源层的 device/dtype；当前实现仅支持 alpha=r。"""
         init = pissa_init(linear.weight.data, r=r, niter=niter)
         module = cls(
             in_features=linear.in_features,
@@ -73,7 +74,7 @@ class PiSSALinear(nn.Module):
             r=r,
             alpha=alpha,
             bias=linear.bias.data if linear.bias is not None else None,
-        )
+        ).to(device=linear.weight.device, dtype=linear.weight.dtype)
         with torch.no_grad():
             module.residual.copy_(init.residual)
             module.lora_A.copy_(init.lora_A)

@@ -1,224 +1,415 @@
-"""[M0] 验证 PiSSA 从零实现的正确性（多根互相独立的支柱，防止"两实现一起错"）。
+"""M0: mathematical correctness, Fast quality, and controlled PEFT alignment.
 
-三件事：
-  1. 重构恒等：W_res + B @ A ≈ W（相对误差应接近浮点精度）；
-     且 PiSSALinear 在初始化时的前向输出与原始 nn.Linear 一致。
-     注：因 W_res 由 W - B@A 定义，本项只验证算术/接线，不验证主成分取法。
-  2. SVD 数学性质（Eckart–Young）：||W_res||_F = sqrt(Σ_{i>r} σ_i²)、||W_res||_2 = σ_{r+1}，
-     独立于任何外部实现地验证 B@A 确为前 r 个主成分。
-  3. 与 HuggingFace PEFT 内置 PiSSA 数值对齐（若已安装 peft/transformers）。
-
-用法：
-    python scripts/m0/verify_init.py --in-features 1024 --out-features 1024 --r 64
+Reconstruction tests wiring, not selection. Analytic fixtures test selection;
+randomized quality and reference agreement are different claims. Small shared
+report/CLI helpers stay here to respect the M0 file whitelist.
 """
-
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+import importlib.metadata
 import json
-import sys
-from datetime import datetime
+import os
 from pathlib import Path
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from unittest.mock import patch
 
 import torch
-import torch.nn as nn
+from torch import nn
+import torch.nn.functional as F
 
-# 让脚本能直接 import 到 src/pissa（无需安装为包）。
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
+from pissa import PiSSALinear, pissa_init  # noqa: E402
 
-from pissa import PiSSALinear, pissa_init, reconstruction_error_against  # noqa: E402
-
-METRICS_DIR = REPO_ROOT / "results" / "m0" / "exp1" / "metrics"
-
-
-def check_reconstruction(in_f: int, out_f: int, r: int, niter: int | None) -> dict:
-    print("== 1. 重构恒等 & 前向一致性 ==")
-    torch.manual_seed(0)
-    linear = nn.Linear(in_f, out_f, bias=True)
-
-    init = pissa_init(linear.weight.data, r=r, niter=niter)
-    rel_err = reconstruction_error_against(init, linear.weight.data)
-    print(f"  ||W_res + B@A - W||_F / ||W||_F = {rel_err:.3e}")
-
-    pissa_layer = PiSSALinear.from_linear(linear, r=r, alpha=r, niter=niter)
-    x = torch.randn(8, in_f)
-    with torch.no_grad():
-        y_ref = linear(x)
-        y_pissa = pissa_layer(x)
-    fwd_err = float(torch.linalg.norm(y_pissa - y_ref) / torch.linalg.norm(y_ref).clamp_min(1e-12))
-    print(f"  初始化前向相对误差 = {fwd_err:.3e}")
-
-    tol = 1e-4 if niter is not None else 1e-5
-    ok = rel_err < tol and fwd_err < tol
-    print(f"  结论：{'通过' if ok else '未通过'}（容差 {tol:.0e}）\n")
-    return {
-        "reconstruction_rel_err": rel_err,
-        "forward_rel_err": fwd_err,
-        "tol": tol,
-        "passed": bool(ok),
-    }
+DEFAULT_OUTPUT = REPO_ROOT / "results/m0/exp1"
+# Predeclared normwise tolerances: FP32 implementation vs FP64 oracle.
+# Absolute allowance scales with ||W||, including at a zero optimal tail.
+EXACT_RTOL, ROUNDING_RTOL = 3e-4, 3e-5
+# Broad approximation safety bounds, not universal near-optimality claims.
+FAST_LIMITS = {"gaussian": 1.50, "decaying": 1.50, "gapped": 1.50}
 
 
-def check_svd_property(in_f: int, out_f: int, r: int) -> dict:
-    """支柱②：用 SVD 的 Eckart–Young 性质独立验证 B@A 确为前 r 个主成分。
-
-    不依赖任何外部实现。最优 rank-r 近似的残差满足：
-        ||W - B@A||_F = sqrt(Σ_{i>r} σ_i²)，  ||W - B@A||_2 = σ_{r+1}
-    残差由矩阵减法 W - B@A 得到，右端由奇异值列表得到，二者本是独立来源；
-    若主成分取错（例如取了最小的 r 个、或拼装错位），等式立即不成立。
-    """
-    print("== 2. SVD 数学性质（Eckart–Young，独立于 PEFT） ==")
-    torch.manual_seed(0)
-    W = torch.randn(out_f, in_f)
-    init = pissa_init(W, r=r)  # 走精确 SVD
-
-    residual = init.residual.float()
-    S = init.singular_values.float()  # 全部奇异值，降序
-
-    # 残差 Frobenius 范数应等于被丢弃奇异值的平方和开根。
-    fro_lhs = float(torch.linalg.norm(residual))
-    fro_rhs = float(torch.sqrt((S[r:] ** 2).sum()))
-    fro_err = abs(fro_lhs - fro_rhs) / max(fro_rhs, 1e-12)
-
-    # 残差谱顶（最大奇异值）应等于原矩阵第 r+1 个奇异值（0-indexed S[r]）。
-    spec_lhs = float(torch.linalg.matrix_norm(residual, ord=2))
-    spec_rhs = float(S[r]) if r < S.numel() else 0.0
-    spec_err = abs(spec_lhs - spec_rhs) / max(spec_rhs, 1e-12)
-
-    # float32 对 O(k) 个奇异值平方求和会有累积误差；容差按 float32 现实设定，
-    # 仍远紧于"取错主成分"会产生的 O(1) 误差，足以判别正确性。
-    fro_tol, spec_tol = 1e-3, 1e-4
-    print(f"  ||W_res||_F vs sqrt(sum_(i>r) sigma_i^2) = {fro_lhs:.4f} vs {fro_rhs:.4f}  (相对误差 {fro_err:.3e})")
-    print(f"  ||W_res||_2 vs sigma_(r+1)               = {spec_lhs:.4f} vs {spec_rhs:.4f}  (相对误差 {spec_err:.3e})")
-    ok = fro_err < fro_tol and spec_err < spec_tol
-    print(f"  结论：{'通过（B@A 确为前 r 个主成分）' if ok else '未通过，主成分取法可疑'}（容差 F={fro_tol:.0e}, 谱={spec_tol:.0e}）\n")
-    return {
-        "frobenius_lhs": fro_lhs,
-        "frobenius_rhs": fro_rhs,
-        "frobenius_rel_err": fro_err,
-        "frobenius_tol": fro_tol,
-        "spectral_lhs": spec_lhs,
-        "spectral_rhs": spec_rhs,
-        "spectral_rel_err": spec_err,
-        "spectral_tol": spec_tol,
-        "passed": bool(ok),
-    }
+class ArgumentParser64(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(64, f"{self.prog}: error: {message}\n")
 
 
-def check_against_peft(r: int) -> dict:
-    print("== 3. 与 PEFT 内置 PiSSA 对齐 ==")
+def atomic_json(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
     try:
-        import transformers  # noqa: F401
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                prefix=path.name + ".", suffix=".tmp", delete=False) as f:
+            temporary = Path(f.name)
+            json.dump(payload, f, ensure_ascii=False, indent=2, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None and temporary.exists():
+            temporary.unlink()
+
+
+def environment(device="cpu"):
+    versions = {}
+    for name in ("torch", "torchvision", "peft", "transformers", "safetensors", "matplotlib", "pytest"):
+        try:
+            versions[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            versions[name] = None
+    git = {"commit": None, "dirty": None, "reason": None}
+    try:
+        git["commit"] = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT,
+            stderr=subprocess.DEVNULL, text=True, timeout=5).strip()
+        git["dirty"] = bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=REPO_ROOT,
+            text=True, timeout=5).strip())
+    except (OSError, subprocess.SubprocessError) as exc:
+        git["reason"] = f"{type(exc).__name__}: {exc}"
+    command, hide = [], False
+    for arg in sys.argv:
+        secret = any(key in arg.lower() for key in ("token", "password", "secret", "api-key"))
+        command.append("<redacted>" if hide or secret else arg)
+        hide = secret and "=" not in arg
+    return {"python": sys.version, "executable": sys.executable, "versions": versions,
+        "cuda_build": torch.version.cuda, "device": str(device),
+        "gpu": torch.cuda.get_device_name(device) if str(device).startswith("cuda") else None,
+        "torch_threads": torch.get_num_threads(),
+        "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+        "initialization_dtype": "torch.float32", "command": command, "git": git}
+
+
+def new_report(experiment, config, device="cpu"):
+    return {"schema_version": 2, "experiment": experiment,
+        "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "exit_code": None,
+        "config": config, "environment": environment(device), "results": {}, "timings_seconds": {}}
+
+
+def finish_report(payload, path, status, code, started):
+    payload.update(status=status, exit_code=code)
+    payload["timings_seconds"]["total"] = time.perf_counter() - started
+    atomic_json(path, payload)
+    return code
+
+
+def run_checks(path, config, checks, device="cpu"):
+    started = time.perf_counter()
+    payload = new_report("M0/verify_init", config, device)
+    payload["results"] = {n: {"status": "pending", "executed": False} for n in checks}
+    atomic_json(path, payload)
+    for name, check in checks.items():
+        payload["results"][name] = {"status": "running", "executed": True}
+        atomic_json(path, payload)
+        tick = time.perf_counter()
+        try:
+            result = check()
+            state = "skipped" if result.get("skipped") else "passed" if result.get("passed") else "failed"
+            result.update(status=state, executed=state != "skipped", skipped=state == "skipped")
+        except Exception as exc:
+            result = {"status": "error", "executed": True, "skipped": False,
+                "exception_type": type(exc).__name__, "reason": str(exc)}
+        payload["results"][name] = result
+        payload["timings_seconds"][name] = time.perf_counter() - tick
+        print(f"{name}: {result['status']} ({payload['timings_seconds'][name]:.3f}s)", flush=True)
+        atomic_json(path, payload)
+    states = [x["status"] for x in payload["results"].values()]
+    executed = [s for s in states if s != "skipped"]
+    payload["executed_all_pass"] = bool(executed) and all(s == "passed" for s in executed)
+    payload["all_pass"] = bool(states) and all(s == "passed" for s in states)
+    status, code = ("error", 1) if "error" in states else ("failed", 1) if "failed" in states else (
+        ("partial", 2) if "skipped" in states else ("passed", 0))
+    return finish_report(payload, path, status, code, started)
+
+
+@contextmanager
+def seeded(seed, device="cpu"):
+    dev = torch.device(device)
+    devices = [dev.index if dev.index is not None else torch.cuda.current_device()] if dev.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        torch.random.default_generator.manual_seed(seed)
+        for index in devices:
+            with torch.cuda.device(index):
+                torch.cuda.manual_seed(seed)
+        yield
+
+
+def norm(x):
+    return float(torch.linalg.vector_norm(x.detach().double()))
+
+
+def relative(a, b):
+    denominator = norm(b)
+    return norm(a.detach().double()-b.detach().double()) / denominator if denominator else None
+
+
+def close(a, b, scale=None, rtol=ROUNDING_RTOL):
+    if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
+        return False
+    scale = norm(b) if scale is None else float(scale)
+    return norm(a.detach().double()-b.detach().double()) <= rtol*norm(b) + ROUNDING_RTOL*max(scale, 1e-30)
+
+
+def known_spectrum(out_f, in_f, r, kind="gapped", seed=0):
+    k = min(out_f, in_f)
+    with seeded(seed):
+        u = torch.linalg.qr(torch.randn(out_f, k, dtype=torch.float64), mode="reduced").Q
+        v = torch.linalg.qr(torch.randn(in_f, k, dtype=torch.float64), mode="reduced").Q
+    if kind == "gapped":
+        s = torch.cat((torch.linspace(10., 5., r, dtype=torch.float64),
+                       torch.linspace(.5, .05, k-r, dtype=torch.float64)))
+    elif kind == "decaying":
+        s = torch.logspace(1., -2., k, dtype=torch.float64)
+    elif kind == "repeated":
+        s = torch.ones(k, dtype=torch.float64)
+    else:
+        raise ValueError(f"Unknown spectrum: {kind}")
+    return ((u*s) @ v.T).float(), (u[:, :r]*s[:r]) @ v[:, :r].T, s
+
+
+def assess_decomposition(w, delta, residual, r, *, expected_s=None, expected_delta=None):
+    if not all(bool(torch.isfinite(t).all()) for t in (w, delta, residual)):
+        return {"passed": False, "reason": "non-finite decomposition"}
+    wd, dd, rd = [t.detach().double() for t in (w, delta, residual)]
+    s = torch.linalg.svdvals(wd) if expected_s is None else expected_s.double().to(w.device)
+    expected_fro = float(torch.linalg.vector_norm(s[r:]))
+    expected_spec = float(s[r]) if r < len(s) else 0.
+    actual_fro, actual_spec = norm(rd), float(torch.linalg.matrix_norm(rd, ord=2))
+    scale = norm(wd)
+    atol = ROUNDING_RTOL*max(scale, 1e-30)
+    gap = float(s[r-1]-s[r]) if r < len(s) else None
+    directional = gap is None or gap > 1e-3*max(float(s[0]), 1e-30)
+    checks = {"reconstruction": close(rd+dd, wd, scale),
+        "residual_frobenius": abs(actual_fro-expected_fro) <= atol+EXACT_RTOL*expected_fro,
+        "residual_spectral": abs(actual_spec-expected_spec) <= atol+EXACT_RTOL*expected_spec,
+        "rank_at_most_r": bool(torch.linalg.svdvals(dd)[r:].max() <= atol) if r < min(w.shape) else True}
+    if expected_delta is not None and directional:
+        checks["known_principal"] = close(dd, expected_delta.to(w.device), scale, EXACT_RTOL)
+    return {"passed": all(checks.values()), "checks": checks,
+        "frobenius_actual": actual_fro, "frobenius_expected": expected_fro,
+        "spectral_actual": actual_spec, "spectral_expected": expected_spec,
+        "principal_rel_err": relative(dd, expected_delta.to(w.device)) if expected_delta is not None else None,
+        "atol": atol, "rtol": EXACT_RTOL, "gap": gap, "direction_comparison_stable": directional,
+        "oracle": "analytic_spectrum" if expected_s is not None else "independent_fp64_svdvals"}
+
+
+def check_reconstruction(in_f, out_f, r, niter=None, device="cpu"):
+    with seeded(0, device):
+        layer = nn.Linear(in_f, out_f).to(device)
+        adapted = PiSSALinear.from_linear(layer, r, alpha=r, niter=niter)
+        x = torch.randn(8, in_f, device=device)
+    with torch.no_grad():
+        reference, actual = layer(x), adapted(x)
+    return {"passed": close(adapted.merged_weight(), layer.weight) and close(actual, reference),
+        "reconstruction_rel_err": relative(adapted.merged_weight(), layer.weight),
+        "forward_rel_err": relative(actual, reference), "rtol": ROUNDING_RTOL,
+        "claim": "arithmetic/function preservation, not top-r selection"}
+
+
+def check_svd_property(in_f, out_f, r, device="cpu"):
+    samples = []
+    for kind in ("gapped", "decaying", "repeated", "gaussian"):
+        if kind == "gaussian":
+            with seeded(0, device):
+                w = torch.randn(out_f, in_f, device=device)
+            expected, s = None, None
+        else:
+            w, expected, s = known_spectrum(out_f, in_f, r, kind)
+            w = w.to(device)
+        init = pissa_init(w, r)
+        result = assess_decomposition(w, init.lora_B @ init.lora_A, init.residual, r,
+                                     expected_s=s, expected_delta=expected)
+        samples.append({"spectrum": kind, **result})
+    return {"passed": all(x["passed"] for x in samples), "samples": samples}
+
+
+def principal_angles(a, b):
+    qa = torch.linalg.qr(a.double(), mode="reduced").Q
+    qb = torch.linalg.qr(b.double(), mode="reduced").Q
+    cosine = torch.linalg.svdvals(qa.T @ qb).clamp(0, 1)
+    return torch.rad2deg(torch.acos(cosine)).cpu().tolist()
+
+
+def check_fast_quality(in_f, out_f, r, niters, seeds, device="cpu"):
+    rows = []
+    for kind in FAST_LIMITS:
+        if kind == "gaussian":
+            with seeded(21, device):
+                w = torch.randn(out_f, in_f, device=device)
+        else:
+            w = known_spectrum(out_f, in_f, r, kind, 21)[0].to(device)
+        u, s, vh = torch.linalg.svd(w.double(), full_matrices=False)
+        optimum, scale = float(torch.linalg.vector_norm(s[r:])), norm(w)
+        for niter in niters:
+            for q in sorted({r, min(min(w.shape), r+8)}):
+                for seed in seeds:
+                    with seeded(seed, device):
+                        tick = time.perf_counter()
+                        init = pissa_init(w, r, niter=niter, q=q)
+                        if str(device).startswith("cuda"):
+                            torch.cuda.synchronize(device)
+                        elapsed = time.perf_counter()-tick
+                    delta = init.lora_B.float() @ init.lora_A.float()
+                    residual = (w-delta).double()
+                    actual = norm(residual)
+                    near_zero = optimum <= ROUNDING_RTOL*max(scale, 1e-30)
+                    ratio = None if near_zero else actual/optimum
+                    passed = close(init.residual, w-delta, scale) and close(init.residual+delta, w, scale)
+                    passed = passed and bool(torch.isfinite(residual).all()) and (
+                        actual <= ROUNDING_RTOL*max(scale, 1e-30) if near_zero else ratio <= FAST_LIMITS[kind]+ROUNDING_RTOL)
+                    gap = float(s[r-1]-s[r]) if r < len(s) else None
+                    stable = gap is None or gap > 1e-3*max(float(s[0]), 1e-30)
+                    rows.append({"spectrum": kind, "r": r, "q": q, "niter": niter, "seed": seed,
+                        "residual_frobenius": actual, "optimal_frobenius": optimum,
+                        "quality_ratio": ratio, "quality_limit": FAST_LIMITS[kind],
+                        "residual_spectral": float(torch.linalg.matrix_norm(residual, ord=2)),
+                        "optimal_spectral": float(s[r]) if r < len(s) else 0.,
+                        "input_angles_degrees": principal_angles(init.lora_A.T, vh[:r].T) if stable else None,
+                        "output_angles_degrees": principal_angles(init.lora_B, u[:, :r]) if stable else None,
+                        "direction_comparison_stable": stable, "passed": bool(passed), "seconds": elapsed})
+    groups = []
+    for kind in FAST_LIMITS:
+        for niter in niters:
+            for q in sorted({row["q"] for row in rows}):
+                group = [x for x in rows if (x["spectrum"], x["niter"], x["q"]) == (kind, niter, q)]
+                values = [x["quality_ratio"] for x in group if x["quality_ratio"] is not None]
+                groups.append({"spectrum": kind, "niter": niter, "q": q, "n": len(group),
+                    "mean": statistics.mean(values) if values else None,
+                    "sample_std": statistics.stdev(values) if len(values)>1 else None,
+                    "worst": max(values) if values else None,
+                    "pass_rate": sum(x["passed"] for x in group)/len(group)})
+    return {"passed": all(x["passed"] for x in rows), "samples": rows, "summary": groups,
+        "interpretation": "predeclared safety bounds; report actual quality, not universal near-optimality"}
+
+
+def import_peft():
+    try:
         from peft import LoraConfig, get_peft_model
-        from transformers import AutoConfig, AutoModelForCausalLM
-    except Exception as exc:  # pragma: no cover - 依赖缺失时优雅跳过
-        print(f"  跳过：未安装 peft/transformers（{exc}）\n")
-        return {"skipped": True, "reason": f"import failed: {exc}"}
-
-    # 构造一个极小的随机 Llama 以便快速对齐，无需联网下载权重。
-    cfg = AutoConfig.for_model(
-        "llama",
-        hidden_size=128,
-        intermediate_size=256,
-        num_hidden_layers=1,
-        num_attention_heads=4,
-        num_key_value_heads=4,
-        vocab_size=320,
-    )
-    torch.manual_seed(0)
-    model = AutoModelForCausalLM.from_config(cfg).to(torch.float32)
-
-    # 取第 0 层 q_proj 作为对照样本。
-    target_name = "model.layers.0.self_attn.q_proj"
-    base_weight = model.get_submodule(target_name).weight.data.clone()
-
-    # 我们的实现
-    ours = pissa_init(base_weight, r=r)
-
-    # PEFT 的实现（init_lora_weights="pissa"，alpha=r → scaling=1）
-    lconf = LoraConfig(
-        r=r,
-        lora_alpha=r,
-        target_modules=["q_proj"],
-        init_lora_weights="pissa",
-        lora_dropout=0.0,
-    )
-    peft_model = get_peft_model(model, lconf)
-    qproj = peft_model.get_submodule("base_model.model." + target_name)
-    peft_A = qproj.lora_A["default"].weight.data
-    peft_B = qproj.lora_B["default"].weight.data
-    peft_res = qproj.base_layer.weight.data
-
-    def rel(a: torch.Tensor, b: torch.Tensor) -> float:
-        return float(torch.linalg.norm(a - b) / torch.linalg.norm(b).clamp_min(1e-12))
-
-    # A、B 的分解不唯一（可差一个 r×r 正交/符号变换），但 B@A 与残差必须一致。
-    ours_delta = ours.lora_B.float() @ ours.lora_A.float()
-    peft_delta = peft_B.float() @ peft_A.float()
-    ba_err = rel(ours_delta, peft_delta)
-    res_err = rel(ours.residual.float(), peft_res.float())
-    print(f"  主成分 B@A 相对误差   = {ba_err:.3e}")
-    print(f"  残差 W_res 相对误差    = {res_err:.3e}")
-    ok = ba_err < 1e-4 and res_err < 1e-4
-    print(f"  结论：{'对齐' if ok else '不一致，需排查'}\n")
-    return {
-        "skipped": False,
-        "reference_layer": target_name,
-        "peft_BA_rel_err": ba_err,
-        "peft_res_rel_err": res_err,
-        "passed": bool(ok),
-    }
+        from transformers import LlamaConfig, LlamaForCausalLM
+        import peft.tuners.lora.layer as lora_layer
+        return (LoraConfig, get_peft_model, LlamaConfig, LlamaForCausalLM, lora_layer), None
+    except ModuleNotFoundError as exc:
+        category = "missing_target_dependency" if exc.name in ("peft", "transformers") else "missing_nested_dependency"
+        return None, {"skipped": True, "category": category, "reason": f"ModuleNotFoundError: {exc.name}"}
+    except Exception as exc:
+        return None, {"skipped": True, "category": "incompatible_import", "reason": f"{type(exc).__name__}: {exc}"}
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="[M0] 验证 PiSSA 初始化正确性")
+def check_against_peft(r, niter=None, device="cpu"):
+    imports, skipped = import_peft()
+    if skipped:
+        return skipped
+    LoraConfig, get_peft_model, LlamaConfig, LlamaForCausalLM, lora_layer = imports
+    size = max(32, ((r+15)//8)*8)  # >= r+8; four heads with even head_dim
+    samples = []
+    with seeded(0, device):
+        for kind in ("gapped", "gaussian"):
+            model = LlamaForCausalLM(LlamaConfig(hidden_size=size, intermediate_size=size*2,
+                num_hidden_layers=1, num_attention_heads=4, num_key_value_heads=4, vocab_size=32)).to(device=device, dtype=torch.float32)
+            name = "model.layers.0.self_attn.q_proj"
+            if kind == "gapped":
+                with torch.no_grad():
+                    model.get_submodule(name).weight.copy_(known_spectrum(size, size, r)[0])
+            w = model.get_submodule(name).weight.detach().clone()
+            with seeded(17, device):
+                ours = pissa_init(w, r, niter=niter, **({"q": r} if niter is not None else {}))
+            config = LoraConfig(r=r, lora_alpha=r, target_modules=["q_proj"], lora_dropout=0.,
+                init_lora_weights="pissa" if niter is None else f"pissa_niter_{niter}")
+            original = lora_layer.svd_lowrank
+            def controlled(*args, **kwargs):
+                with seeded(17, device):
+                    return original(*args, **kwargs)
+            with patch.object(lora_layer, "svd_lowrank", controlled):
+                adapted = get_peft_model(model, config)
+            target = adapted.get_submodule("base_model.model."+name)
+            pa, pb = target.lora_A["default"].weight, target.lora_B["default"].weight
+            pd, od = pb @ pa, ours.lora_B @ ours.lora_A
+            pr = target.base_layer.weight
+            x = torch.randn(8, size, device=device)
+            with torch.no_grad():
+                py = target(x)
+                oy = F.linear(x, ours.residual)+F.linear(F.linear(x, ours.lora_A), ours.lora_B)
+            samples.append({"spectrum": kind, "shape": [size, size], "r": r,
+                "q": r if niter is not None else None,
+                "passed": all([close(od, pd), close(ours.residual, pr), close(ours.residual+od, pr+pd), close(oy, py)]),
+                "BA_rel_err": relative(od, pd), "residual_rel_err": relative(ours.residual, pr),
+                "merged_rel_err": relative(ours.residual+od, pr+pd), "forward_rel_err": relative(oy, py)})
+    return {"passed": all(x["passed"] for x in samples), "samples": samples, "niter": niter,
+        "rng_control": "isolated at svd_lowrank entry; q unchanged", "rtol": ROUNDING_RTOL}
+
+
+def check_contracts(device="cpu"):
+    rows = []
+    for dtype in (torch.float32, torch.float64, torch.bfloat16, torch.float16):
+        with seeded(9, device):
+            base = nn.Linear(12, 10, device=device, dtype=dtype)
+            layer = PiSSALinear.from_linear(base, 3)
+            x = torch.randn(4, 12, device=device, dtype=dtype)
+        with torch.no_grad():
+            reference, actual = base(x), layer(x)
+        rtol = {torch.float16: .01, torch.bfloat16: .08}.get(dtype, ROUNDING_RTOL)
+        rows.append({"dtype": str(dtype), "device": str(device), "forward_rel_err": relative(actual, reference),
+            "passed": layer.lora_A.dtype == dtype and layer.residual.device == base.weight.device and
+                       close(actual.float(), reference.float(), rtol=rtol)})
+    try:
+        PiSSALinear(8, 8, 2, alpha=4)
+    except ValueError:
+        alpha_rejected = True
+    else:
+        alpha_rejected = False
+    return {"passed": all(x["passed"] for x in rows) and alpha_rejected, "samples": rows,
+        "alpha_mismatch_rejected": alpha_rejected, "note": "storage dtype preserved; decomposition computes FP32"}
+
+
+def main(argv=None):
+    parser = ArgumentParser64(description="M0 mathematical, Fast quality and PEFT checks")
     parser.add_argument("--in-features", type=int, default=1024)
     parser.add_argument("--out-features", type=int, default=1024)
     parser.add_argument("--r", type=int, default=64)
-    parser.add_argument("--niter", type=int, default=None, help="设置则用快速随机化 SVD")
+    parser.add_argument("--niter", type=int, default=None)
+    parser.add_argument("--niters", nargs="+", type=int, default=[2, 4])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--skip-peft", action="store_true")
-    args = parser.parse_args()
-
-    config = {
-        "in_features": args.in_features,
-        "out_features": args.out_features,
-        "r": args.r,
-        "niter": args.niter,
-        "skip_peft": bool(args.skip_peft),
-        "seed": 0,
-    }
-    results = {
-        "reconstruction_and_forward": check_reconstruction(
-            args.in_features, args.out_features, args.r, args.niter
-        ),
-        "svd_property_eckart_young": check_svd_property(
-            args.in_features, args.out_features, args.r
-        ),
-        "peft_alignment": (
-            check_against_peft(args.r)
-            if not args.skip_peft
-            else {"skipped": True, "reason": "--skip-peft"}
-        ),
-    }
-    all_pass = all(
-        v.get("passed", False)
-        for v in results.values()
-        if not v.get("skipped", False)
-    )
-
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = METRICS_DIR / "verify.json"
-    payload = {
-        "experiment": "M0/verify_init",
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "config": config,
-        "results": results,
-        "all_pass": all_pass,
-    }
-    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"已保存 metrics：{out_path}")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args(argv)
+    if min(args.in_features, args.out_features, args.r, args.threads)<=0 or args.r>min(args.in_features, args.out_features):
+        parser.error("positive dimensions/threads and 0 < r <= min(shape) required")
+    if any(n<0 for n in args.niters) or (args.niter is not None and args.niter<0):
+        parser.error("niter must be nonnegative")
+    if len(set(args.seeds)) != len(args.seeds) or len(set(args.niters)) != len(args.niters):
+        parser.error("seeds and niters must be distinct")
+    torch.set_num_threads(args.threads)
+    config = {**vars(args), "output": str(args.output.resolve()), "storage_dtype": "torch.float32"}
+    checks = {
+        "reconstruction_and_forward": lambda: check_reconstruction(args.in_features, args.out_features, args.r, args.niter, args.device),
+        "svd_property_eckart_young": lambda: check_svd_property(args.in_features, args.out_features, args.r, args.device),
+        "fast_quality": lambda: check_fast_quality(args.in_features, args.out_features, args.r, args.niters, args.seeds, args.device),
+        "layer_contracts": lambda: check_contracts(args.device)}
+    skipped = lambda: {"skipped": True, "reason": "--skip-peft", "category": "user_requested"}
+    checks["peft_exact"] = skipped if args.skip_peft else lambda: check_against_peft(args.r, device=args.device)
+    for niter in args.niters:
+        checks[f"fast_reconstruction_and_forward_niter_{niter}"] = lambda n=niter: check_reconstruction(
+            args.in_features, args.out_features, args.r, n, args.device)
+        checks[f"peft_fast_niter_{niter}"] = skipped if args.skip_peft else lambda n=niter: check_against_peft(args.r, n, args.device)
+    def lora_check():
+        if __package__:
+            from .mnist_toy import check_lora_peft
+        else:
+            from mnist_toy import check_lora_peft
+        return check_lora_peft(args.device)
+    checks["lora_peft"] = skipped if args.skip_peft else lora_check
+    return run_checks(args.output / "metrics/verify.json", config, checks, args.device)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

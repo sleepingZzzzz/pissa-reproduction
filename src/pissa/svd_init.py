@@ -31,7 +31,7 @@ class PiSSAInit:
     residual: torch.Tensor  # (out_features, in_features)，冻结
     # 奇异值（降序），用于画图/分析。注意长度取决于 niter：
     #   niter=None（精确 SVD）：全部 min(out, in) 个奇异值；
-    #   niter 为整数（Fast SVD）：只有前 q=min(min(out, in), r+8) 个近似值，不是完整谱。
+    #   Fast SVD：只有前 q 个近似值（默认 min(min(out, in), r+8)），不是完整谱。
     singular_values: torch.Tensor
 
 
@@ -39,6 +39,8 @@ def pissa_init(
     weight: torch.Tensor,
     r: int,
     niter: int | None = None,
+    *,
+    q: int | None = None,
 ) -> PiSSAInit:
     """对单个权重矩阵做 PiSSA 初始化。
 
@@ -50,6 +52,8 @@ def pissa_init(
             若为整数，用快速随机化 SVD（``torch.svd_lowrank``，对应论文的 Fast SVD），
             niter 为幂迭代次数。此时返回的 ``singular_values`` 只含前 q 个近似值，
             随机性来自 torch 全局随机数，复现时需先固定 seed。
+    q:      仅用于 Fast SVD 的求解维度，r <= q <= min(out, in)。
+            None 保持原默认 min(min(out, in), r+8)，最终适配器秩始终为 r。
     """
     if weight.ndim != 2:
         raise ValueError(f"weight 必须是二维矩阵，收到 shape={tuple(weight.shape)}")
@@ -57,6 +61,11 @@ def pissa_init(
     k = min(out_features, in_features)
     if not 0 < r <= k:
         raise ValueError(f"r 必须落在 (0, {k}]，收到 r={r}")
+    if q is not None:
+        if niter is None:
+            raise ValueError("q 仅适用于 niter 非 None 的 Fast SVD")
+        if isinstance(q, bool) or not isinstance(q, int) or not r <= q <= k:
+            raise ValueError(f"q 必须是 [{r}, {k}] 内的整数，收到 q={q!r}")
 
     # SVD 在 float32/float64 上数值更稳，算完再转回原 dtype。
     orig_dtype = weight.dtype
@@ -68,7 +77,7 @@ def pissa_init(
         singular_values = S
     else:
         # 随机化低秩 SVD：只求前 q 个，q 略大于 r 以提升精度。
-        q = min(k, r + 8)
+        q = min(k, r + 8) if q is None else q
         U, S, V = torch.svd_lowrank(W, q=q, niter=niter)
         Ur, Sr, Vhr = U[:, :r], S[:r], V[:, :r].mH
         singular_values = S
