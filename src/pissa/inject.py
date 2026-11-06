@@ -10,6 +10,7 @@ try:  # 进度条为可选依赖，缺失时退化为直通迭代器。
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
     def tqdm(it, **kwargs):
+        """缺少 tqdm 时原样返回迭代对象，忽略进度条参数。"""
         return it
 
 # Llama / Qwen / Gemma 等主流 dense 解码器的全部线性层（注意力 + MLP）。
@@ -25,17 +26,26 @@ DEFAULT_TARGET_MODULES = (
 
 
 def _match(name: str, targets: tuple[str, ...]) -> bool:
+    """按模块名称最后一段精确匹配目标名称。"""
     leaf = name.rsplit(".", 1)[-1]
     return leaf in targets
 
 
 def _check_targets(model: nn.Module, targets: tuple[str, ...]) -> list[str]:
-    """收集并校验待替换的层名；校验失败时直接报错（此时模型尚未被改动）。
+    """在修改模型前收集并校验全部目标线性层名称。
 
-    - 拒绝量化层（bitsandbytes 的 Linear4bit / Linear8bitLt）与非浮点权重：
-      对打包的 uint8 权重做 SVD 没有意义。
-    - 拒绝共享层：named_modules() 默认按对象去重，同一个 Linear 以多个名字注册时，
-      只有一个名字会被替换，其余别名仍指向旧层，模型会静默变成两套权重。
+    Args:
+        model: 待检查的模型，不在此函数中修改。
+        targets: 模块叶名称元组。
+
+    Returns:
+        待替换模块的完整名称列表。
+
+    Raises:
+        TypeError: 目标是已知量化层或权重不是浮点张量。
+        ValueError: 同一目标 Linear 对象注册为多个名称。
+
+    共享模块检查针对对象别名，不代表检测任意不同模块之间的共享权重。
     """
     names_by_id: dict[int, list[str]] = {}
     for name, module in model.named_modules(remove_duplicate=False):
@@ -66,9 +76,19 @@ def inject_pissa(
     target_modules: tuple[str, ...] = DEFAULT_TARGET_MODULES,
     niter: int | None = None,
 ) -> list[str]:
-    """就地把命中 ``target_modules`` 的 nn.Linear 替换为 PiSSALinear。
+    """原地将目标 nn.Linear 替换为 PiSSALinear，并逐层释放旧引用。
 
-    返回被替换模块的名字列表，便于核对覆盖范围。
+    Args:
+        model: 待修改的模型。
+        r: 适配器秩。
+        alpha: None 或 r，受 PiSSALinear 的范围限制。
+        target_modules: 要匹配的模块叶名称，默认包含注意力及 MLP 的七种投影。
+        niter: None 为精确 SVD，整数为 Fast SVD 幂迭代次数。
+
+    Returns:
+        被替换模块的完整名称列表。源层的设备和精度由 from_linear 保留。
+
+    目标类型与共享模块先整体校验；后续初始化失败时不保证回滚此前替换。
     """
     replaced: list[str] = []
     # 只保存名字，不保存模块对象：每层替换后旧 Linear 立即可被回收，
@@ -87,7 +107,14 @@ def inject_pissa(
 
 
 def merge_pissa(model: nn.Module) -> list[str]:
-    """把模型中所有 PiSSALinear 折叠回标准 nn.Linear，返回被折叠的名字列表。"""
+    """原地将全部 PiSSALinear 折叠为普通线性层，返回被合并的名称列表。
+
+    Args:
+        model: 含 PiSSA 层的模型；合并后保留各层设备和精度。
+
+    Returns:
+        按遍历顺序记录的被合并模块名称，不再保留独立 A/B。
+    """
     merged: list[str] = []
     # 同 inject_pissa：只存名字，逐层释放旧模块。
     names = [name for name, module in model.named_modules() if isinstance(module, PiSSALinear)]
@@ -103,7 +130,14 @@ def merge_pissa(model: nn.Module) -> list[str]:
 
 
 def trainable_parameters(model: nn.Module) -> tuple[int, int]:
-    """返回 (可训练参数量, 总参数量)。"""
+    """返回 (可训练 Parameter 元素数, 全部 Parameter 元素数)。
+
+    Args:
+        model: 待统计的模型。
+
+    Returns:
+        两个整数；均不计 buffer，注入后的第二项不能当作原始基座参数量。
+    """
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     return trainable, total

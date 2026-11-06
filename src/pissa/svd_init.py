@@ -24,7 +24,14 @@ import torch
 
 @dataclass
 class PiSSAInit:
-    """一次 PiSSA 初始化的产物（均为 PyTorch nn.Linear 约定下的张量）。"""
+    """一次初始化的 A、B、残差及奇异值，均采用源权重精度和设备。
+
+    Attributes:
+        lora_A: 形状 (r, in_features) 的主成分右因子。
+        lora_B: 形状 (out_features, r) 的主成分左因子。
+        residual: 形状 (out_features, in_features) 的剩余权重。
+        singular_values: 精确 SVD 的完整谱，或 Fast SVD 的前 q 个近似值。
+    """
 
     lora_A: torch.Tensor  # (r, in_features)
     lora_B: torch.Tensor  # (out_features, r)
@@ -42,18 +49,22 @@ def pissa_init(
     *,
     q: int | None = None,
 ) -> PiSSAInit:
-    """对单个权重矩阵做 PiSSA 初始化。
+    """对单个二维线性权重分离主成分低秩因子与残差。
 
-    参数
-    ----
-    weight: (out_features, in_features) 的二维张量。
-    r:      主成分（适配器）秩。
-    niter:  若为 None，用精确 SVD（``torch.linalg.svd``）；
-            若为整数，用快速随机化 SVD（``torch.svd_lowrank``，对应论文的 Fast SVD），
-            niter 为幂迭代次数。此时返回的 ``singular_values`` 只含前 q 个近似值，
-            随机性来自 torch 全局随机数，复现时需先固定 seed。
-    q:      仅用于 Fast SVD 的求解维度，r <= q <= min(out, in)。
-            None 保持原默认 min(min(out, in), r+8)，最终适配器秩始终为 r。
+    Args:
+        weight: 形状 (out_features, in_features) 的权重，不原地修改。
+        r: 主成分秩，满足 0 < r <= min(out_features, in_features)。
+        niter: None 使用精确 SVD；整数使用随机低秩 SVD，表示幂迭代次数。
+        q: Fast SVD 求解维度，满足 r <= q <= min(out_features, in_features)；
+            None 保持 min(min(out_features, in_features), r+8) 的默认值。
+
+    Returns:
+        PiSSAInit。先脱离梯度并以 float32 计算，再转回源精度；
+        A = sqrt(Sr) Vhr，B = Ur sqrt(Sr)，residual = W - B @ A。
+        精确分支的谱长为 min(out, in)，Fast 分支为 q；Fast 消耗全局随机数。
+
+    Raises:
+        ValueError: 权重非二维、秩越界，或 q 不符合 Fast 分支的约束。
     """
     if weight.ndim != 2:
         raise ValueError(f"weight 必须是二维矩阵，收到 shape={tuple(weight.shape)}")

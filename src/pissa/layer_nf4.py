@@ -1,8 +1,8 @@
-"""[M3] PiSSALinear with NF4-quantized frozen residual (QPiSSA).
+"""既有 QPiSSA 层：对冻结残差进行 NF4 量化。
 
-关键设计：NF4 量化数据（residual_nf4/residual_absmax/residual_code）在 **CPU 上
-计算并存储为纯 Python 属性**，不注册为 nn.Buffer。forward 时手动搬到 GPU 解量化。
-这样 model.to(device, dtype) 不会破坏 NF4 打包数据。
+打包数据、absmax 与码本保存在 CPU 普通属性中，不注册为 buffer，避免 .to()
+改变打包数据的类型；前向时手动迁移并解量化。原浮点 residual buffer 仍保留。
+量化实现改进属于第四阶段，本次仅整理文档。
 """
 
 from __future__ import annotations
@@ -18,7 +18,11 @@ from .svd_init import pissa_init
 
 
 class NFPiSSALinear(PiSSALinear):
-    """PiSSALinear with NF4-quantized frozen residual."""
+    """对冻结残差做 NF4 量化的既有 PiSSA 层，保留普通精度 A/B。
+
+    打包权重及量化元数据放在 CPU 普通属性中，不随 .to(...) 自动迁移。
+    原 residual buffer 仍被保留；本次不改变其存储或序列化设计。
+    """
 
     _nf4_ready: bool
     residual_nf4: torch.Tensor      # CPU uint8 packed NF4 weights
@@ -36,6 +40,15 @@ class NFPiSSALinear(PiSSALinear):
         alpha: float | None = None,
         bias: torch.Tensor | None = None,
     ) -> None:
+        """创建普通 PiSSA 存储和未就绪的 CPU 量化属性。
+
+        Args:
+            in_features: 输入维度。
+            out_features: 输出维度。
+            r: 适配器秩。
+            alpha: None 或 r，沿用父类限制。
+            bias: 可选冻结偏置。
+        """
         super().__init__(in_features, out_features, r, alpha, bias)
         self._nf4_ready = False
         self.residual_nf4 = torch.empty(0, dtype=torch.uint8)
@@ -53,7 +66,18 @@ class NFPiSSALinear(PiSSALinear):
         alpha: float | None = None,
         niter: int | None = None,
     ) -> "NFPiSSALinear":
-        """构造并量化残差。"""
+        """从线性层执行 SVD、复制初始化结果，再量化残差。
+
+        Args:
+            linear: 源线性层，不原地修改。
+            r: 适配器秩。
+            alpha: None 或 r。
+            niter: None 为精确 SVD，整数为 Fast SVD 幂迭代次数。
+
+        Returns:
+            新量化 PiSSA 层；沿用先默认设备和精度分配再复制的既有行为，
+            注入调用方随后迁移设备和精度。此处不声称与源层逐位等价。
+        """
         init = pissa_init(linear.weight.data, r=r, niter=niter)
         module = cls(
             in_features=linear.in_features,
@@ -73,7 +97,11 @@ class NFPiSSALinear(PiSSALinear):
 
     @torch.no_grad()
     def quantize_residual(self) -> None:
-        """NF4 量化当前 residual（CPU 上执行），量化后释放 residual buffer。"""
+        """将残差转为 CPU float32 做 NF4 量化，并缓存打包数据。
+
+        已就绪时直接返回；原 residual buffer 仍保留，不在此处释放。
+        量化数据、absmax 与码本作为普通属性保存，不自动进入 state_dict。
+        """
         if self._nf4_ready:
             return
         # 搬到 CPU 做 NF4 量化
@@ -93,6 +121,10 @@ class NFPiSSALinear(PiSSALinear):
         # state_dict / model.to() 等流程；强行改 shape 会破坏 PyTorch 内部状态。
 
     def _dequant_residual(self) -> torch.Tensor:
+        """在 A 的设备上重建 QuantState 并解量化，返回 A 精度的残差。
+
+        量化尚未就绪时直接返回原 residual；就绪时每次调用都搬运并解量化。
+        """
         if not self._nf4_ready:
             return self.residual
         device = self.lora_A.device
@@ -111,6 +143,7 @@ class NFPiSSALinear(PiSSALinear):
         return residual_dq.to(self.lora_A.dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """以解量化残差计算基座映射，再加低秩增量，输出形状 (..., out)。"""
         residual_fp = self._dequant_residual()
         base = F.linear(x, residual_fp, self.bias)
         delta = F.linear(F.linear(x, self.lora_A), self.lora_B)
@@ -118,10 +151,12 @@ class NFPiSSALinear(PiSSALinear):
 
     @torch.no_grad()
     def merged_weight(self) -> torch.Tensor:
+        """返回解量化残差加缩放 B @ A；结果通常不等于量化前源权重。"""
         return self._dequant_residual() + self.scaling * (self.lora_B @ self.lora_A)
 
     @torch.no_grad()
     def to_linear(self) -> nn.Linear:
+        """将解量化后的等效权重复制到默认设备和精度创建的新 nn.Linear。"""
         linear = nn.Linear(self.in_features, self.out_features, bias=self.bias is not None)
         linear.weight.data.copy_(self.merged_weight())
         if self.bias is not None:
