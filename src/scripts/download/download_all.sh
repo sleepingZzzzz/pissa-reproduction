@@ -2,7 +2,7 @@
 # 下载并准备全部数据与模型（M1 / M2 / M3 共用）。
 #
 # 内容：
-#   1. MetaMathQA 前 100K 条 + GSM8K test（经 scripts/m1/prepare_data.py 落成本地 jsonl）
+#   1. MetaMathQA 前 100K 条 + GSM8K test（经 src/scripts/m1/prepare_data.py 落成本地 jsonl）
 #   2. LLaMA-2-7B           -> M1 / M3
 #   3. ChatGLM3-6B-Base     -> M2
 #   4. Baichuan2-7B-Base    -> M2
@@ -10,7 +10,7 @@
 #   6. Meta-Llama-3-8B      -> M2（跳过 original/ 下 16GB 的 .pth 副本）
 #
 # 用法（建议在 screen/tmux 里，约需 70GB 磁盘；网速一般时全部下完需数小时）：
-#   bash scripts/download/download_all.sh 2>&1 | tee -a download_all.log
+#   bash src/scripts/download/download_all.sh 2>&1 | tee -a download_all.log
 #
 # 前置：已按 requirements.txt 装好依赖（需要 modelscope 及其命令行 `modelscope`）。
 #
@@ -28,14 +28,14 @@
 export MODELSCOPE_CACHE=/root/autodl-tmp/.cache/modelscope
 export HF_HOME=/root/autodl-tmp/.cache/huggingface
 
-# 定位仓库根目录（本脚本位于 <repo>/scripts/download/）
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# 定位仓库根目录（本脚本位于 <repo>/src/scripts/download/）
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$REPO" || exit 1
 
 stamp() { echo; echo "===== [$(date '+%F %T')] $* ====="; }
 
 stamp "1/6 数据：MetaMathQA 前 100K + GSM8K test"
-python scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml
+python src/scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml
 echo "prepare_data exit=$?"
 
 stamp "2/6 LLaMA-2-7B（参数与 common.resolve_model_path 一致，训练时直接命中缓存）"

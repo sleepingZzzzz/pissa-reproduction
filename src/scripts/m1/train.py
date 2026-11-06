@@ -4,12 +4,18 @@
 训练后把适配器合并回权重并 save_pretrained，供 eval_gsm8k.py 评测。
 
 用法：
-    python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method pissa
-    python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method lora  --limit 64   # 冒烟
-    python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method full
+    python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method pissa
+    python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method lora  --limit 64   # 冒烟
+    python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method full
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# 直接执行文件时，将 src 加入导入路径。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
 import json
@@ -21,26 +27,32 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from common import (
-    Collator,
-    abspath,
+from scripts.data_ops import Collator, read_jsonl, tokenize_example
+from utils import abspath, load_config, set_seed, torch_dtype
+from scripts.model_ops import (
     apply_adapter,
     build_optimizer,
     fix_unregistered_meta_tensors,
     load_base_model,
-    load_config,
     load_tokenizer,
     merge_adapter,
-    read_jsonl,
     resolve_model_path,
-    set_seed,
-    tokenize_example,
-    torch_dtype,
-    unwrap_qlora,
 )
+from lora.inject_nf4 import unwrap_qlora
 
 
 def cosine_lr(step: int, total: int, warmup: int, base_lr: float) -> float:
+    """返回给定优化步的学习率：先线性预热，再按余弦衰减。
+
+    Args:
+        step: 从零开始的优化步编号。
+        total: 总优化步数。
+        warmup: 预热步数。
+        base_lr: 预热结束时的学习率。
+
+    Returns:
+        该步学习率；本函数不修改优化器。
+    """
     if step < warmup:
         return base_lr * (step + 1) / max(warmup, 1)
     progress = (step - warmup) / max(total - warmup, 1)
@@ -51,11 +63,18 @@ FINAL_LOSS_POINTS = 10  # final_loss 取最后多少个记录点的均值
 
 
 def _tail_mean(curve: list[dict], key: str, n: int) -> float | None:
+    """返回曲线末 n 个记录中 key 字段的算术平均；曲线为空时返回 None。"""
     tail = curve[-n:]
     return sum(c[key] for c in tail) / len(tail) if tail else None
 
 
 def main() -> None:
+    """执行配置驱动的微调，合并或导出适配器，保存 checkpoint 与训练指标。
+
+    从命令行选择方法和可选样本上限；读取 JSONL、分词、右填充，按配置进行
+    梯度累积、调度和优化。记录累积窗口的平均 loss，final_loss 为末尾记录均值。
+    调用会加载模型、可能下载权重并训练；导入模块不会自动执行。
+    """
     parser = argparse.ArgumentParser(description="[M1] 训练 PiSSA/LoRA/Full")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
     parser.add_argument("--method", required=True, choices=["pissa", "lora", "full", "qpissa", "qlora"])
@@ -268,10 +287,13 @@ def main() -> None:
 
 
 class _nullctx:
+    """在不需要自动混合精度时提供不抑制异常的空上下文。"""
     def __enter__(self):
+        """进入空上下文，返回 None。"""
         return None
 
     def __exit__(self, *a):
+        """返回 False，将上下文内异常继续向外传播。"""
         return False
 
 

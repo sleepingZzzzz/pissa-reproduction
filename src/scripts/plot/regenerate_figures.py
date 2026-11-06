@@ -9,17 +9,20 @@
 每图同时导出 .pdf（论文嵌入）与 .png（预览）。
 
 用法：
-    python scripts/plot/regenerate_figures.py
+    python src/scripts/plot/regenerate_figures.py
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import matplotlib.pyplot as plt
 
-from academic_style import (
+from scripts.plot.academic_style import (
     apply_style,
     method_color,
     method_label,
@@ -28,24 +31,26 @@ from academic_style import (
     grid_y_only,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+REPO = Path(__file__).resolve().parents[3]
 RESULTS = REPO / "results"
 
 METHOD_ORDER = ["full", "lora", "pissa", "qlora", "qpissa"]
 
 
 def _read(p: Path) -> dict:
+    """将 UTF-8 JSON 文件解析为对象；调用方预期为字典。"""
     return json.loads(p.read_text(encoding="utf-8"))
 
 
 def _present_methods(metrics_dir: Path, kind: str) -> list[str]:
+    """根据 kind_*.json 文件名检测方法，按已知顺序及未知名称排序。"""
     found = [p.stem[len(kind) + 1:] for p in metrics_dir.glob(f"{kind}_*.json")]
     known = [m for m in METHOD_ORDER if m in found]
     return known + sorted(m for m in found if m not in METHOD_ORDER)
 
 
 def _ema(values: list[float], alpha: float = 0.15) -> list[float]:
-    """指数滑动平均（带偏差校正），用于平滑训练 loss。alpha 越小越平滑。"""
+    """从首个观测值起递推指数移动平均，不做额外偏差校正。"""
     out, m = [], 0.0
     for i, v in enumerate(values):
         m = v if i == 0 else alpha * v + (1 - alpha) * m
@@ -54,6 +59,7 @@ def _ema(values: list[float], alpha: float = 0.15) -> list[float]:
 
 
 def plot_loss_curves(metrics_dir: Path, out_stem: Path, alpha: float = 0.15) -> None:
+    """从旧指标结构读取各方法 loss，平滑后输出曲线；没有可用曲线时不保存。"""
     methods = _present_methods(metrics_dir, "train")
     if not methods:
         return
@@ -84,6 +90,7 @@ def plot_loss_curves(metrics_dir: Path, out_stem: Path, alpha: float = 0.15) -> 
 
 
 def plot_accuracy_bar(metrics_dir: Path, out_stem: Path) -> None:
+    """从已有 eval 指标读取准确率，绘制并保存方法对比柱状图。"""
     methods = _present_methods(metrics_dir, "eval")
     accs = []
     for m in methods:
@@ -149,6 +156,7 @@ def plot_m2_grouped(out_stem: Path) -> None:
 
 
 def plot_m0_singular(out_stem: Path) -> None:
+    """按该绘图器预期的旧 M0 JSON 结构绘制谱图，不适配新报告结构。"""
     p = RESULTS / "m0" / "exp1" / "metrics" / "singular.json"
     if not p.exists():
         return
@@ -176,6 +184,7 @@ def plot_m0_singular(out_stem: Path) -> None:
 
 
 def plot_m0_mnist(out_stem: Path) -> None:
+    """按该绘图器预期的旧 M0 JSON 结构绘制 MNIST 曲线，不重新运行实验。"""
     p = RESULTS / "m0" / "exp1" / "metrics" / "mnist.json"
     if not p.exists():
         return
@@ -194,6 +203,10 @@ def plot_m0_mnist(out_stem: Path) -> None:
 
 
 def main() -> None:
+    """批量重绘 M0–M3 既有指标的图像，可能覆盖各阶段同名图片。
+
+    此入口尚未适配新 M0 JSON；当前阶段不要调用。本次只迁移路径及整理文档。
+    """
     apply_style()
 
     m1 = RESULTS / "m1" / "exp1"

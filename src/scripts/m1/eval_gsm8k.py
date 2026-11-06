@@ -1,11 +1,17 @@
 """[M1] 在 GSM8K test 上评测训练好的合并模型，计算 exact-match 准确率。
 
 用法：
-    python scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method pissa
-    python scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method lora --limit 100
+    python src/scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method pissa
+    python src/scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method lora --limit 100
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# 直接执行文件时，将 src 加入导入路径。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 import argparse
 import json
@@ -15,22 +21,16 @@ from datetime import datetime
 import torch
 from tqdm import tqdm
 
-from common import (
-    PROMPT_TEMPLATE,
-    abspath,
-    fix_unregistered_meta_tensors,
-    load_config,
-    load_tokenizer,
-    read_jsonl,
-    torch_dtype,
-    inject_lora_4bit as inject_qlora_eval,
-)
+from scripts.data_ops import PROMPT_TEMPLATE, read_jsonl
+from utils import abspath, load_config, torch_dtype
+from scripts.model_ops import fix_unregistered_meta_tensors, load_tokenizer
+from lora.inject_nf4 import inject_lora_4bit as inject_qlora_eval
 
 _NUM = re.compile(r"-?\d[\d,]*\.?\d*")
 
 
 def extract_answer(text: str) -> str | None:
-    """从文本中抽取最终数字答案：优先 'The answer is X'，否则取最后一个数字。"""
+    """优先提取 answer is 后的数字，否则取最后一个数字；无匹配时返回 None。"""
     m = re.search(r"answer is\s*\$?(-?\d[\d,]*\.?\d*)", text, flags=re.IGNORECASE)
     if m:
         return m.group(1).replace(",", "").rstrip(".")
@@ -41,13 +41,18 @@ def extract_answer(text: str) -> str | None:
 
 
 def gold_answer(answer_field: str) -> str | None:
-    """GSM8K 金标答案在 '#### N' 之后。"""
+    """提取 GSM8K 答案中最后一个 #### 之后的文本，无标记时退回数字抽取。"""
     if "####" in answer_field:
         return answer_field.split("####")[-1].strip().replace(",", "")
     return extract_answer(answer_field)
 
 
 def main() -> None:
+    """加载指定方法 checkpoint，以左填充和 attention_mask 生成 GSM8K 回答并保存准确率。
+
+    命令行可覆盖 checkpoint 或限制评测条数；按现有数字抽取规则做字符串匹配。
+    本入口不根据测试集选择超参数或训练 checkpoint。
+    """
     parser = argparse.ArgumentParser(description="[M1] GSM8K 评测")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
     parser.add_argument("--method", required=True, choices=["pissa", "lora", "full", "qpissa", "qlora"])

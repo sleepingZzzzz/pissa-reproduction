@@ -1,13 +1,9 @@
-"""M0: mathematical correctness, Fast quality, and controlled PEFT alignment.
+"""M0：分别验证重构、主成分选择、Fast SVD 质量及受控 PEFT 对齐。
 
-Reconstruction tests wiring, not selection. Analytic fixtures test selection;
-randomized quality and reference agreement are different claims. Small shared
-report/CLI helpers stay here to respect the M0 file whitelist.
-
-Supplement: niter=0 sensitivity rows are diagnostics, not new acceptance
-criteria. The 1.50 safety bound is retained after observing prior good-setting
-ratios up to about 1.034; retaining it is not blind calibration. PEFT checks
-include both the requested rank and a fixed r/k=16/256 regime.
+重构只验证接线；解析谱样本验证选择。随机近似质量和参考实现一致性是不同结论。
+niter=0 敏感性行仅为诊断，不是新的验收标准。既有良好设置曾观察到约 1.034 的
+质量比，当前保留 1.50 安全界限，不能称为盲校准。PEFT 检查包含用户指定秩和
+固定的 r/k=16/256 区间。小型报告与命令行工具沿用既有 M0 组织。
 """
 from __future__ import annotations
 
@@ -29,7 +25,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 from pissa import PiSSALinear, pissa_init  # noqa: E402
 
@@ -42,12 +38,15 @@ FAST_LIMITS = {"gaussian": 1.50, "decaying": 1.50, "gapped": 1.50}
 
 
 class ArgumentParser64(argparse.ArgumentParser):
+    """将命令行参数错误的退出码统一为 64 的 ArgumentParser。"""
     def error(self, message):
+        """打印 usage 和错误消息，以退出码 64 结束进程。"""
         self.print_usage(sys.stderr)
         self.exit(64, f"{self.prog}: error: {message}\n")
 
 
 def atomic_json(path, payload):
+    """以 UTF-8 临时文件和原子替换写入 JSON，拒绝 NaN，并在结束时清理临时文件。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = None
@@ -65,6 +64,7 @@ def atomic_json(path, payload):
 
 
 def environment(device="cpu"):
+    """采集解释器、依赖版本、设备及 Git 状态；命令参数中的疑似密钥做脱敏。"""
     versions = {}
     for name in ("torch", "torchvision", "peft", "transformers", "safetensors", "matplotlib", "pytest"):
         try:
@@ -94,12 +94,14 @@ def environment(device="cpu"):
 
 
 def new_report(experiment, config, device="cpu"):
+    """创建含配置、环境和 running 状态的 schema_version=2 报告字典。"""
     return {"schema_version": 2, "experiment": experiment,
         "timestamp": datetime.now(timezone.utc).isoformat(), "status": "running", "exit_code": None,
         "config": config, "environment": environment(device), "results": {}, "timings_seconds": {}}
 
 
 def finish_report(payload, path, status, code, started):
+    """更新最终状态、退出码和总耗时，原子写报告并返回传入的退出码。"""
     payload.update(status=status, exit_code=code)
     payload["timings_seconds"]["total"] = time.perf_counter() - started
     atomic_json(path, payload)
@@ -107,6 +109,17 @@ def finish_report(payload, path, status, code, started):
 
 
 def run_checks(path, config, checks, device="cpu"):
+    """逐项执行检查并持续写报告，区分通过、失败、异常与跳过。
+
+    Args:
+        path: 报告 JSON 路径。
+        config: 写入报告的配置。
+        checks: 检查名称到无参数可调用对象的有序映射。
+        device: 用于环境记录的设备。
+
+    Returns:
+        全部通过为 0，失败或异常为 1，包含跳过且无失败为 2。
+    """
     started = time.perf_counter()
     payload = new_report("M0/verify_init", config, device)
     payload["results"] = {n: {"status": "pending", "executed": False} for n in checks}
@@ -137,6 +150,15 @@ def run_checks(path, config, checks, device="cpu"):
 
 @contextmanager
 def seeded(seed, device="cpu"):
+    """临时设置指定 CPU/CUDA 随机流，退出上下文后恢复原状态。
+
+    Args:
+        seed: 上下文内的随机种子。
+        device: CPU 或要隔离随机流的 CUDA 设备。
+
+    Yields:
+        无返回值的随机流隔离上下文。
+    """
     dev = torch.device(device)
     devices = [dev.index if dev.index is not None else torch.cuda.current_device()] if dev.type == "cuda" else []
     with torch.random.fork_rng(devices=devices):
@@ -148,15 +170,18 @@ def seeded(seed, device="cpu"):
 
 
 def norm(x):
+    """将张量脱离梯度并转为 float64，返回展平后的欧氏范数。"""
     return float(torch.linalg.vector_norm(x.detach().double()))
 
 
 def relative(a, b):
+    """返回 ||a-b||/||b||；参考范数为零时返回 None。"""
     denominator = norm(b)
     return norm(a.detach().double()-b.detach().double()) / denominator if denominator else None
 
 
 def close(a, b, scale=None, rtol=ROUNDING_RTOL):
+    """按有限值和混合绝对/相对范数误差判断接近，不执行逐元素 allclose。"""
     if not bool(torch.isfinite(a).all() and torch.isfinite(b).all()):
         return False
     scale = norm(b) if scale is None else float(scale)
@@ -164,6 +189,7 @@ def close(a, b, scale=None, rtol=ROUNDING_RTOL):
 
 
 def known_spectrum(out_f, in_f, r, kind="gapped", seed=0):
+    """用已知奇异谱构造测试矩阵，返回 FP32 权重、FP64 主成分及完整谱。"""
     k = min(out_f, in_f)
     with seeded(seed):
         u = torch.linalg.qr(torch.randn(out_f, k, dtype=torch.float64), mode="reduced").Q
@@ -181,6 +207,7 @@ def known_spectrum(out_f, in_f, r, kind="gapped", seed=0):
 
 
 def assess_decomposition(w, delta, residual, r, *, expected_s=None, expected_delta=None):
+    """核对有限值、重构、残差范数和秩；谱隙稳定时才比较主成分方向。"""
     if not all(bool(torch.isfinite(t).all()) for t in (w, delta, residual)):
         return {"passed": False, "reason": "non-finite decomposition"}
     wd, dd, rd = [t.detach().double() for t in (w, delta, residual)]
@@ -207,6 +234,7 @@ def assess_decomposition(w, delta, residual, r, *, expected_s=None, expected_del
 
 
 def check_reconstruction(in_f, out_f, r, niter=None, device="cpu"):
+    """检查合并权重与前向保持初始映射；该检查不能证明选中了主成分。"""
     with seeded(0, device):
         layer = nn.Linear(in_f, out_f).to(device)
         adapted = PiSSALinear.from_linear(layer, r, alpha=r, niter=niter)
@@ -220,6 +248,7 @@ def check_reconstruction(in_f, out_f, r, niter=None, device="cpu"):
 
 
 def check_svd_property(in_f, out_f, r, device="cpu"):
+    """使用已知谱与独立 FP64 参考核对精确 SVD 的主成分和最优残差性质。"""
     samples = []
     for kind in ("gapped", "decaying", "repeated", "gaussian"):
         if kind == "gaussian":
@@ -237,6 +266,7 @@ def check_svd_property(in_f, out_f, r, device="cpu"):
 
 
 def principal_angles(a, b):
+    """对两组列空间做 QR/SVD，返回主夹角的角度值列表。"""
     qa = torch.linalg.qr(a.double(), mode="reduced").Q
     qb = torch.linalg.qr(b.double(), mode="reduced").Q
     cosine = torch.linalg.svdvals(qa.T @ qb).clamp(0, 1)
@@ -244,6 +274,7 @@ def principal_angles(a, b):
 
 
 def check_fast_quality(in_f, out_f, r, niters, seeds, device="cpu"):
+    """按固定矩阵、种子、q 和迭代次数检查 Fast SVD 质量，返回逐样本报告。"""
     rows = []
     for kind in FAST_LIMITS:
         if kind == "gaussian":
@@ -296,11 +327,10 @@ def check_fast_quality(in_f, out_f, r, niters, seeds, device="cpu"):
 
 
 def check_fast_sensitivity(in_f, out_f, r, seeds, device="cpu"):
-    """Predeclared no-power-iteration probes on the same matrices/seeds.
+    """对相同矩阵和种子运行预定的无幂迭代诊断。
 
-    q cannot be smaller than r: q=r is the smaller valid solver setting.
-    niter=0 is intended to reduce quality, not guaranteed to do so per sample.
-    Missing the old quality bound here is a diagnostic observation, not failure.
+    q 不得小于 r，q=r 是较小的合法求解维度。niter=0 用于探测质量敏感性，
+    不保证每个样本都会变差；超过既有质量阈值在这里仅记录，不判定验收失败。
     """
     result = check_fast_quality(in_f, out_f, r, [0], seeds, device)
     rows = []
@@ -320,6 +350,7 @@ def check_fast_sensitivity(in_f, out_f, r, seeds, device="cpu"):
 
 
 def import_peft():
+    """按需导入 PEFT 接口；不可用时返回空接口和明确的跳过原因。"""
     try:
         from peft import LoraConfig, get_peft_model
         from transformers import LlamaConfig, LlamaForCausalLM
@@ -333,6 +364,7 @@ def import_peft():
 
 
 def check_against_peft(r, niter=None, device="cpu"):
+    """在受控 SVD 随机流下核对 PEFT 的精确/Fast 初始化及前向，返回对齐报告。"""
     imports, skipped = import_peft()
     if skipped:
         return skipped
@@ -357,6 +389,7 @@ def check_against_peft(r, niter=None, device="cpu"):
                 init_lora_weights="pissa" if niter is None else f"pissa_niter_{niter}")
             original = lora_layer.svd_lowrank
             def controlled(*args, **kwargs):
+                """为 lowrank SVD 临时隔离随机流，保证两套实现使用同一分解随机性。"""
                 with seeded(17, device):
                     return original(*args, **kwargs)
             with patch.object(lora_layer, "svd_lowrank", controlled):
@@ -380,6 +413,7 @@ def check_against_peft(r, niter=None, device="cpu"):
 
 
 def check_contracts(device="cpu"):
+    """检查 PiSSA 的精度、设备、初始映射及 alpha 不等于 r 时拒绝的契约。"""
     rows = []
     for dtype in (torch.float32, torch.float64, torch.bfloat16, torch.float16):
         with seeded(9, device):
@@ -403,6 +437,7 @@ def check_contracts(device="cpu"):
 
 
 def main(argv=None):
+    """解析验证参数，执行数学性质、Fast 质量、PEFT 对齐与契约检查，返回退出码。"""
     parser = ArgumentParser64(description="M0 mathematical, Fast quality and PEFT checks")
     parser.add_argument("--in-features", type=int, default=1024)
     parser.add_argument("--out-features", type=int, default=1024)
@@ -436,6 +471,7 @@ def main(argv=None):
             args.in_features, args.out_features, args.r, n, args.device)
         checks[f"peft_fast_niter_{niter}"] = skipped if args.skip_peft else lambda n=niter: check_against_peft(args.r, n, args.device)
     def lora_check():
+        """按包导入或直接脚本模式加载 M0 的 LoRA/PEFT 对齐检查并执行。"""
         if __package__:
             from .mnist_toy import check_lora_peft
         else:

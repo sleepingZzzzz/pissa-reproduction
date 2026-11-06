@@ -3,19 +3,32 @@
 train/eval 脚本只读这两个 jsonl，与下载源解耦（modelscope 或 hf）。
 
 用法：
-    python scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml
-    python scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml --limit 2000  # 冒烟
+    python src/scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml
+    python src/scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml --limit 2000  # 冒烟
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 直接执行文件时，将 src 加入导入路径。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import argparse
 import json
 
-from common import abspath, load_config
+from utils import abspath, load_config
 
 
 def _load_metamath(cfg: dict):
+    """按 data.source 加载 MetaMathQA 的 train split，返回可逐条迭代的数据集。
+
+    Args:
+        cfg: 含数据来源和仓库名称的配置；modelscope 走 MsDataset，其余走 HF。
+
+    可能联网下载或使用本地缓存，不在这里截取样本或统一字段。
+    """
     dcfg = cfg["data"]
     if dcfg["source"] == "modelscope":
         from modelscope.msdatasets import MsDataset
@@ -31,6 +44,13 @@ def _load_metamath(cfg: dict):
 
 
 def _load_gsm8k(cfg: dict):
+    """按数据来源与子集名称加载 GSM8K test，返回可逐条迭代的数据集。
+
+    Args:
+        cfg: 提供 data.source、数据集仓库及 gsm8k_subset 的配置。
+
+    可能联网下载或使用本地缓存，不在这里限制评测数据量。
+    """
     dcfg = cfg["data"]
     if dcfg["source"] == "modelscope":
         from modelscope.msdatasets import MsDataset
@@ -51,6 +71,11 @@ def _load_gsm8k(cfg: dict):
 
 
 def main() -> None:
+    """解析配置与 limit，将训练及评测数据写成 JSONL，覆盖已有目标文件。
+
+    训练字段统一为 instruction/response；limit 限制原始遍历条数，而非有效写入数。
+    评测字段保留 question/answer，写入全部有效 GSM8K test 样本，不按训练 limit 截取。
+    """
     parser = argparse.ArgumentParser(description="[M1] 准备 MetaMathQA + GSM8K")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
     parser.add_argument("--limit", type=int, default=None, help="只取前 N 条（冒烟测试）")

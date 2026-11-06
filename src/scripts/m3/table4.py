@@ -8,8 +8,8 @@
 同时保留 Frobenius 范数下的降低率作参考（旧口径，便于对照历史结果）。
 
 用法（需基座模型权重 + CUDA；纯前向计算，不训练）：
-    python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml          # 全部层（对齐原文）
-    python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml --layers 2  # 冒烟（前 2 层）
+    python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml          # 全部层（对齐原文）
+    python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml --layers 2  # 冒烟（前 2 层）
 """
 
 from __future__ import annotations
@@ -25,20 +25,14 @@ import torch
 import torch.nn as nn
 import bitsandbytes as bnb
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from pissa import PiSSALinear, inject_pissa, merge_pissa
 from pissa.svd_init import pissa_init, reconstruction_error_against
 
-# 复用 M1 common 的配置/模型加载
-sys.path.insert(0, str(REPO_ROOT / "scripts" / "m1"))
-from common import (
-    abspath,
-    load_config,
-    resolve_model_path,
-    torch_dtype,
-)
+from utils import abspath, load_config, torch_dtype
+from scripts.model_ops import resolve_model_path
 
 # PiSSA 初始化的 loRA_A/loRA_B 命名
 LORA_A = "lora_A"
@@ -60,6 +54,7 @@ def nuclear_norm(m: torch.Tensor) -> float:
 
 
 def linear_layers(model: nn.Module, target_modules: tuple[str, ...]) -> list[tuple[str, nn.Linear]]:
+    """按目标模块叶名称收集 nn.Linear，返回 (完整名称, 模块) 列表。"""
     return [
         (n, m) for n, m in model.named_modules()
         if isinstance(m, nn.Linear) and n.rsplit(".", 1)[-1] in target_modules
@@ -67,6 +62,7 @@ def linear_layers(model: nn.Module, target_modules: tuple[str, ...]) -> list[tup
 
 
 def main() -> None:
+    """加载基座并计算逐投影类型的 NF4 误差统计，保存 Table 4 指标；不执行训练。"""
     parser = argparse.ArgumentParser(description="[M3] Table 4 量化误差")
     parser.add_argument("--config", default="configs/m3_llama2_7b.yaml")
     parser.add_argument("--layers", type=int, default=None, help="只测前 N 层（冒烟）")

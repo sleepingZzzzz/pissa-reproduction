@@ -3,15 +3,21 @@
 读取 results/m1/exp1/metrics/ 下已有的 train_*.json 与 eval_*.json，缺哪个跳过哪个。
 
 用法：
-    python scripts/m1/plot_curves.py --config configs/m1_llama2_7b.yaml
+    python src/scripts/m1/plot_curves.py --config configs/m1_llama2_7b.yaml
 """
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# 直接执行文件时，将 src 加入导入路径。
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 import argparse
 import json
 
-from common import abspath, load_config
+from utils import abspath, load_config
 
 # 已知方法的固定绘图顺序；未列出的方法按字母序追加在后面。
 METHOD_ORDER = ["full", "lora", "pissa", "qlora", "qpissa"]
@@ -29,6 +35,7 @@ def _ordered_methods(metrics_dir, kind: str) -> list[str]:
 
 
 def main() -> None:
+    """读取已有训练/评测指标 JSON，绘制损失曲线和准确率柱状图并写入配置输出目录。"""
     parser = argparse.ArgumentParser(description="汇总作图：训练 loss 曲线 + GSM8K 准确率柱状图")
     parser.add_argument("--config", default="configs/m1_llama2_7b.yaml")
     parser.add_argument("--prefix", default=None, help="输出图文件名前缀（默认取 experiment 名）")

@@ -85,6 +85,7 @@ def apply_style() -> None:
 
 
 def method_color(name: str) -> str:
+    """返回已知方法的固定颜色；未知名称按 Python hash 选择回退颜色。"""
     key = name.lower()
     if key in METHOD_COLORS:
         return METHOD_COLORS[key]
@@ -93,6 +94,7 @@ def method_color(name: str) -> str:
 
 
 def method_label(name: str) -> str:
+    """返回已知方法的展示名称；未知名称转为大写。"""
     return METHOD_LABELS.get(name.lower(), name.upper())
 
 

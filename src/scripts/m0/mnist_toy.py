@@ -1,13 +1,9 @@
-"""M0 odd-to-even MNIST mechanism experiment, not a Fig.2(a) trajectory replica.
+"""M0：奇数类别预训练、偶数类别微调的 MNIST 机制实验，并非论文轨迹复刻。
 
-Three Linear layers, two hidden ReLUs. Each seed retrains one shared base;
-four paired methods see identical batches. Test data never selects settings.
-
---scan is an exploratory, validation-only one-factor diagnostic. It reserves
-10% of even training samples with a separate fixed split seed and never loads
-the official test set. Main mode keeps all even training data and its original
-random streams. Per-step displacements concern effective FC weights, including
-for full_ft (not its enc/head). Displacement alone does not establish causality.
+每个 seed 训练一个共享基座，四种方法使用配对批次，测试集不用于挑选设置。
+--scan 是训练集内部验证的单因素探索诊断：用独立划分种子留出 10% 偶数训练样本，
+不加载官方测试集；主实验保留全部偶数训练样本及原随机流。
+逐步位移针对有效 FC 权重，full_ft 也只统计其中 FC；位移本身不证明因果关系。
 """
 from __future__ import annotations
 
@@ -41,20 +37,26 @@ LABELS = {"fc_full": "FC weight+bias", "full_ft": "Full-model FT", "lora": "LoRA
 
 
 class MLP(nn.Module):
-    """784 -> hidden -> hidden -> 10; head returns logits, not probabilities."""
+    """三层线性网络：784 → hidden → hidden → 10，返回未归一化的分类 logits。"""
     def __init__(self, hidden=256):
+        """创建编码层、中间 FC 和分类头；hidden 为两层隐藏宽度。"""
         super().__init__()
         self.enc = nn.Linear(784, hidden)
         self.fc = nn.Linear(hidden, hidden)
         self.head = nn.Linear(hidden, 10)
 
     def forward(self, x):
+        """将图像展平为 (N, 784)，经过两次 ReLU 后返回 (N, 10) logits。"""
         return self.head(F.relu(self.fc(F.relu(self.enc(x.flatten(1))))))
 
 
 class LoRALinear(nn.Module):
-    """Gaussian std=1/r A, zero B; frozen base and bias, no dropout."""
+    """M0 高斯初始化 LoRA：A 标准差为 1/r，B 为零，冻结基座和偏置。
+
+    这是 M0 实验条件，不与 M1 的 Kaiming 初始化 LoRA 合并。
+    """
     def __init__(self, linear, r, alpha=None):
+        """校验秩与缩放，在源设备、源精度创建冻结基座和可训练 A/B。"""
         super().__init__()
         if isinstance(r, bool) or not isinstance(r, int) or not 0 < r <= min(linear.weight.shape):
             raise ValueError("r must be an integer in (0, min(weight.shape)]")
@@ -70,20 +72,24 @@ class LoRALinear(nn.Module):
             device=linear.weight.device, dtype=linear.weight.dtype))
 
     def forward(self, x):
+        """返回基座输出与缩放低秩增量，输入 (..., in)，输出 (..., out)。"""
         return F.linear(x, self.weight, self.bias)+self.scaling*F.linear(F.linear(x, self.lora_A), self.lora_B)
 
 
 def seed_bundle(seed):
+    """由一个 seed 派生基座、预训练数据、适配器和微调数据的四路固定种子。"""
     return {"base": seed, "pretrain_data": seed+100_003,
             "adapter": seed+200_003, "finetune_data": seed+300_007}
 
 
 def make_loader(dataset, batch, seed, shuffle):
+    """使用独立的 CPU Generator 构建 DataLoader，不消耗全局随机流。"""
     return DataLoader(dataset, batch_size=batch, shuffle=shuffle,
                       generator=torch.Generator().manual_seed(seed), num_workers=0, drop_last=False)
 
 
 def batch_stream(loader):
+    """无限重复遍历非空 loader；若一轮没有任何批次则抛出 ValueError。"""
     if not len(loader):
         raise ValueError("empty training loader")
     while True:
@@ -91,6 +97,17 @@ def batch_stream(loader):
 
 
 def get_loaders(batch, *, seed=0, train_dataset=None, test_dataset=None):
+    """构建奇数训练、偶数微调及偶数测试三个数据加载器。
+
+    Args:
+        batch: 每批样本数。
+        seed: 数据加载器的独立种子。
+        train_dataset: 可选注入训练数据。
+        test_dataset: 可选注入测试数据；两者任一为 None 时都重新加载官方 MNIST。
+
+    Returns:
+        odd、even、test 三个 loader 的字典；测试数据只用于预先约定的评测。
+    """
     if train_dataset is None or test_dataset is None:
         from torchvision import datasets, transforms
         transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((.1307,), (.3081,))])
@@ -98,6 +115,7 @@ def get_loaders(batch, *, seed=0, train_dataset=None, test_dataset=None):
         train_dataset = datasets.MNIST(str(DATA_DIR), train=True, download=True, transform=transform)
         test_dataset = datasets.MNIST(str(DATA_DIR), train=False, download=True, transform=transform)
     def subset(dataset, parity):
+        """按 parity 指定的奇偶性筛选 MNIST targets，返回 Subset。"""
         labels = torch.as_tensor(dataset.targets)
         indices = (labels % 2 == parity).nonzero(as_tuple=True)[0].tolist()
         if not indices:
@@ -110,7 +128,18 @@ def get_loaders(batch, *, seed=0, train_dataset=None, test_dataset=None):
 
 def get_scan_loaders(batch, *, seed=0, split_seed=20261101, validation_fraction=.1,
                      train_dataset=None):
-    """Load training data only; split without consuming any global RNG stream."""
+    """仅加载训练数据，使用独立随机流划分偶数训练与验证样本。
+
+    Args:
+        batch: 每批样本数。
+        seed: loader 种子。
+        split_seed: 独立划分种子。
+        validation_fraction: 偶数训练数据中留作验证的比例。
+        train_dataset: 可选注入数据；None 时加载或下载 MNIST 训练集。
+
+    Returns:
+        奇数预训练、偶数微调、验证 loader 及划分信息；不加载官方测试集。
+    """
     if not 0 < validation_fraction < 1:
         raise ValueError("validation_fraction must be between zero and one")
     if train_dataset is None:
@@ -139,7 +168,7 @@ def get_scan_loaders(batch, *, seed=0, split_seed=20261101, validation_fraction=
 
 @torch.no_grad()
 def effective_fc_weight(model):
-    """Actual linear map in FC: base + scaled BA, never raw adapter factors."""
+    """返回 FC 的实际等效权重，适配器分支包含缩放 B @ A，而非裸因子。"""
     if isinstance(model.fc, PiSSALinear):
         return model.fc.merged_weight().detach()
     if isinstance(model.fc, LoRALinear):
@@ -148,6 +177,7 @@ def effective_fc_weight(model):
 
 
 def validate_initialization(base, model, method, r, probe):
+    """检查训练范围、初始 logits 和损失与基座一致，返回初始化诊断。"""
     names = {name for name, p in model.named_parameters() if p.requires_grad}
     expected = set(dict(base.named_parameters())) if method == "full_ft" else (
         {"fc.weight", "fc.bias"} if method == "fc_full" else {"fc.lora_A", "fc.lora_B"})
@@ -171,6 +201,7 @@ def validate_initialization(base, model, method, r, probe):
 
 
 def prepare_method(base, method, r, probe):
+    """深拷贝基座并配置四种微调范围之一，返回模型及初始化检查统计。"""
     if method not in METHODS:
         raise ValueError(f"unknown method: {method}")
     model = copy.deepcopy(base)
@@ -187,11 +218,13 @@ def prepare_method(base, method, r, probe):
 
 
 def frozen_state(model):
+    """克隆冻结 Parameter 和全部 buffer，用于后续检查它们是否被改动。"""
     return {**{n: p.detach().clone() for n, p in model.named_parameters() if not p.requires_grad},
             **{n: b.detach().clone() for n, b in model.named_buffers()}}
 
 
 def validate_frozen(model, before):
+    """逐项检查冻结快照与当前模型完全一致；不一致时抛出 ValueError。"""
     current = {**dict(model.named_parameters()), **dict(model.named_buffers())}
     if any(n not in current or not torch.equal(value, current[n]) for n, value in before.items()):
         raise ValueError("frozen parameter/buffer changed")
@@ -199,6 +232,7 @@ def validate_frozen(model, before):
 
 @torch.no_grad()
 def evaluate(model, loader, device):
+    """无梯度计算按样本加权的交叉熵和准确率，恢复调用前的训练模式。"""
     training = model.training
     model.eval()
     total_loss, correct, count = 0., 0, 0
@@ -218,6 +252,7 @@ def evaluate(model, loader, device):
 
 
 def pretrain(model, loader, epochs, device):
+    """以 Adam 预训练奇数类别，返回每轮在线损失、更新步数与样本数。"""
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     model.train()
     losses, samples, steps = [], 0, 0
@@ -242,12 +277,32 @@ def pretrain(model, loader, epochs, device):
 
 def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_window, *,
              record_displacement=True, evaluation_steps=None, evaluation_role=None):
+    """以固定步数微调并定期评测，检查冻结状态，可选记录 FC 位移。
+
+    Args:
+        model: 已配置训练范围的模型，会原地更新。
+        loader: 可循环的微调数据加载器。
+        steps: 优化步数。
+        lr: Adam 学习率。
+        device: 训练设备。
+        eval_loader: 定期评测的数据加载器。
+        eval_every: 评测步数间隔。
+        tail_window: 尾部在线损失平均所用的步数。
+        record_displacement: 是否记录有效 FC 权重在相邻优化步之间的位移。
+        evaluation_steps: 可选评测步集合；非 None 时替代固定间隔规则。
+        evaluation_role: 可选评测用途标签，写入评测结果。
+
+    Returns:
+        损失曲线、评测点、冻结检查、计时和可选位移等统计。
+        位移是描述性诊断，不能单独建立训练差异的因果解释。
+    """
     before = frozen_state(model)
     opt = torch.optim.Adam([p for p in model.parameters() if p.requires_grad], lr=lr)
     stream, losses, evaluations, sizes = batch_stream(loader), [], [], []
     displacements = []
     previous = effective_fc_weight(model).clone() if record_displacement else None
     def evaluation(step):
+        """返回给定 step 的评测结果，并按需附加用途标签。"""
         result = {"step": step, **evaluate(model, eval_loader, device)}
         if evaluation_role is not None:
             result["role"] = evaluation_role
@@ -292,6 +347,7 @@ def finetune(model, loader, steps, lr, device, eval_loader, eval_every, tail_win
 
 
 def check_lora_peft(device="cpu"):
+    """对齐 PEFT 的 M0 高斯初始化和非零因子前向；缺依赖时返回跳过原因。"""
     imports, skipped = import_peft()
     if skipped:
         return skipped
@@ -302,6 +358,7 @@ def check_lora_peft(device="cpu"):
         calls = []
         original_normal = nn.init.normal_
         def record_normal(tensor, mean=0., std=1., **kwargs):
+            """记录 PEFT 调用 normal_ 的形状和分布参数，再执行原初始化。"""
             calls.append({"shape": list(tensor.shape), "mean": mean, "std": std})
             return original_normal(tensor, mean=mean, std=std, **kwargs)
         with patch.object(nn.init, "normal_", record_normal):
@@ -330,6 +387,7 @@ def check_lora_peft(device="cpu"):
 
 
 def paired_summary(runs):
+    """汇总同 seed 的 PiSSA 减 LoRA 测试损失差，仅做描述性统计。"""
     differences = []
     for run in runs:
         methods = run["methods"]
@@ -343,7 +401,7 @@ def paired_summary(runs):
 
 
 def scan_grid(lrs, ranks, base_r, base_lr):
-    """One-factor grid; reuse the shared lr=base_lr/r=base_r cells."""
+    """构建单因素学习率/秩扫描，复用公共基准单元，不生成完整交叉格。"""
     cells = {}
     for lr in lrs:
         for method in METHODS:
@@ -359,7 +417,7 @@ def scan_grid(lrs, ranks, base_r, base_lr):
 
 
 def scan_protocol(args):
-    """Written to disk before data loading/training; never revised by outcomes."""
+    """构造训练前落盘的扫描协议；不根据结果重写规则，也不访问测试集。"""
     return {"diagnostic_only": True, "origin": "exploratory follow-up to already observed main results",
         "evaluation_split": "training_even_validation_only", "official_test_loaded": False,
         "split_seed": args.split_seed, "validation_fraction": args.validation_fraction,
@@ -378,6 +436,7 @@ def scan_protocol(args):
 
 
 def scan_table(runs, checkpoints):
+    """展开各 seed、实验单元及指定验证 checkpoint 的结果，返回表格行列表。"""
     rows = []
     for run in runs:
         for cell in run["experiments"]:
@@ -397,10 +456,15 @@ def scan_table(runs, checkpoints):
 
 
 def scan_comparisons(table, protocol):
+    """按预定规则汇总配对差、相邻趋势和验证集选定学习率的比较。
+
+    返回描述性比较；验证选定的分数不是独立测试估计，不作显著性或因果推断。
+    """
     index = {(x["seed"], x["method"], x["lr"], x["r"], x["step"]): x for x in table}
     seeds, checkpoints = protocol["seeds"], protocol["checkpoints"]
     base_r, base_lr = protocol["base_r"], protocol["base_lr"]
     def paired(method_a, lr_a, r_a, method_b, lr_b, r_b, step):
+        """在相同 seed 配对候选与参考的验证损失，返回差值及描述性汇总。"""
         differences = [{"seed": seed, "difference": index[(seed, method_a, lr_a, r_a, step)]["validation_loss"]-
                         index[(seed, method_b, lr_b, r_b, step)]["validation_loss"]} for seed in seeds]
         return {"paired_differences": differences, "a_lower_loss_count": sum(x["difference"]<0 for x in differences),
@@ -440,6 +504,7 @@ def scan_comparisons(table, protocol):
 
 
 def run_scan(args, datasets=None):
+    """执行训练集内部验证扫描，保存协议、逐单元结果、比较与诊断图，返回退出码。"""
     config = {**vars(args), "output": str(args.output.resolve()), "data_dir": str(DATA_DIR),
         "mode": "diagnostic_scan", "data_source": "official_MNIST_train_only" if datasets is None else "injected_test_fixture",
         "storage_dtype": "torch.float32", "main_experiment_changed": False}
@@ -504,6 +569,15 @@ def run_scan(args, datasets=None):
 
 
 def main(argv=None, *, datasets=None):
+    """解析参数并执行 M0 主实验或验证扫描，保存报告与图，返回退出码。
+
+    Args:
+        argv: 可选命令行参数列表；None 时读取进程参数。
+        datasets: 可选测试数据对；注入假数据时明确标记为合成 smoke 证据。
+
+    Returns:
+        成功为 0，执行失败为 1；非法参数由解析器以 64 退出。
+    """
     parser = ArgumentParser64(description="Paired odd-to-even MNIST mechanism experiment")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--ft-steps", type=int, default=300)

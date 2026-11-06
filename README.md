@@ -58,7 +58,7 @@ All numbers are GSM8K exact-match accuracy (test set, 1319 problems). Adapter ra
 |---|:---:|:---:|:---:|
 | value (Frobenius, 2 layers) | 7.19% | 1.51% | **79.0%** |
 
-> Note: the number above uses the **Frobenius** norm over only 2 sampled layers, so the reduction ratio is inflated. `scripts/m3/table4.py` has since been updated to match the original paper's metric — **nuclear-norm** error-reduction ratio, computed over **all** layers and grouped by projection type (Q/K/V/O/Gate/Up/Down), with `AVG` = mean of per-type means. Re-run on the server (`python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml`) to obtain the paper-aligned table (expected PiSSA AVG ≈ 19% for LLaMA-2-7B, highest on Q). The Frobenius reduction is still emitted as a reference field.
+> Note: the number above uses the **Frobenius** norm over only 2 sampled layers, so the reduction ratio is inflated. `src/scripts/m3/table4.py` has since been updated to match the original paper's metric — **nuclear-norm** error-reduction ratio, computed over **all** layers and grouped by projection type (Q/K/V/O/Gate/Up/Down), with `AVG` = mean of per-type means. Re-run on the server (`python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml`) to obtain the paper-aligned table (expected PiSSA AVG ≈ 19% for LLaMA-2-7B, highest on Q). The Frobenius reduction is still emitted as a reference field.
 
 > QPiSSA mathematically reduces the NF4 quantization error of the frozen residual (Table 4), but in end-to-end training it underperformed QLoRA. The most likely cause is our from-scratch NF4 path in `src/pissa/layer_nf4.py` (CPU→GPU dequantize each forward) being numerically weaker than bitsandbytes' native fused 4-bit matmul kernel used by QLoRA. Reported honestly as an engineering limitation.
 
@@ -66,7 +66,10 @@ All numbers are GSM8K exact-match accuracy (test set, 1319 problems). Adapter ra
 
 ```
 src/pissa/          From-scratch implementation: svd_init / layer (PiSSALinear) / layer_nf4 (NFPiSSALinear) / inject
-scripts/m0..m3/     Runnable scripts per milestone (m1/ scripts are reused for M2/M3 via different configs)
+src/scripts/       Experiment entry points and shared model_ops.py / data_ops.py
+src/lora/          LoRA layers and injection; quantized branches remain separate
+src/utils.py       Shared configuration, seed, path, and dtype helpers
+                   M2/M3 reuse src/scripts/m1/ with their respective configs
 configs/            Experiment configs (base.yaml holds shared hyperparameters)
 results/m*/exp*/    Experiment artifacts (figures/*.png, metrics/*.json with loss curves, accuracy, and 20 sample generations each)
 logs/               Raw training / eval run logs (large model-download logs are pruned)
@@ -97,16 +100,16 @@ pip install -r requirements.txt
 
 ```bash
 # 1. Mathematical checks + Fast quality + exact/Fast PEFT and LoRA alignment
-python scripts/m0/verify_init.py --in-features 1024 --out-features 1024 --r 64 --seeds 0 1 2 --niters 2 4 --device cpu
+python src/scripts/m0/verify_init.py --in-features 1024 --out-features 1024 --r 64 --seeds 0 1 2 --niters 2 4 --device cpu
 
 # 2. Paired mechanism experiment: retrain one shared base per seed
-python scripts/m0/mnist_toy.py --epochs 3 --ft-steps 300 --seeds 0 1 2 --eval-every 100 --device cuda
+python src/scripts/m0/mnist_toy.py --epochs 3 --ft-steps 300 --seeds 0 1 2 --eval-every 100 --device cuda
 
 # 3a. Paper-sample path: set this to an existing local safetensors directory
-python scripts/m0/plot_singular.py --local-path "PATH_TO_LLAMA2_SNAPSHOT" --layer model.layers.0.self_attn.q_proj --r 128
+python src/scripts/m0/plot_singular.py --local-path "PATH_TO_LLAMA2_SNAPSHOT" --layer model.layers.0.self_attn.q_proj --r 128
 
 # 3b. Alternative real-weight demonstration (network required; not the paper sample)
-python scripts/m0/plot_singular.py --source auto
+python src/scripts/m0/plot_singular.py --source auto
 ```
 
 Use the project's Python environment (PEFT 0.18.1); on this Windows checkout it is
@@ -159,7 +162,7 @@ Seeds do not guarantee bitwise equality across hardware or dependency versions.
 **Revised M0 status:** implementation smoke results do not replace a full run of
 this protocol. No PiSSA performance ordering is a pass criterion. JSON schema v2
 stores per-seed toy results under `results.runs`; do not run the old
-`scripts/plot/regenerate_figures.py` on it. Its compatibility and the paper draft
+`src/scripts/plot/regenerate_figures.py` on it. Its compatibility and the paper draft
 are deferred; this stage does not rewrite M1–M3 figures or `paper/figures/`.
 
 ## Running M1
@@ -168,18 +171,18 @@ LLaMA-2-7B on MetaMathQA, evaluated on GSM8K. Config: `configs/m1_llama2_7b.yaml
 
 ```bash
 # 0. Prepare data (downloads MetaMathQA + GSM8K via ModelScope, writes local jsonl)
-python scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml          # add --limit 2000 for a smoke run
+python src/scripts/m1/prepare_data.py --config configs/m1_llama2_7b.yaml          # add --limit 2000 for a smoke run
 
 # 1. Train each method (saves merged model to checkpoints/m1/<method>)
-python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method pissa  # add --limit 64 for a smoke run
-python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method lora
-python scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method full
+python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method pissa  # add --limit 64 for a smoke run
+python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method lora
+python src/scripts/m1/train.py --config configs/m1_llama2_7b.yaml --method full
 
 # 2. Evaluate on GSM8K
-python scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method pissa
+python src/scripts/m1/eval_gsm8k.py --config configs/m1_llama2_7b.yaml --method pissa
 
 # 3. Plot loss curves + accuracy bars
-python scripts/m1/plot_curves.py --config configs/m1_llama2_7b.yaml
+python src/scripts/m1/plot_curves.py --config configs/m1_llama2_7b.yaml
 ```
 
 Memory strategy on a single 96GB GPU: PiSSA/LoRA train in fp32 (frozen base + tiny adapter) with gradient checkpointing on — fp32 activations are large, so disabling it OOMs even on 96GB; Full-FT cannot fit 7B in fp32 (params + AdamW state + grads ≈ 112GB), so it uses bf16 + 8-bit AdamW + gradient checkpointing (`methods.full` in the config). TF32 matmul is enabled in `train.py` to speed up the fp32 paths with negligible numerical impact (this is the main speed lever; it saves no memory). The smoke path (small `--limit`) is meant to be run first to validate the pipeline before launching the long runs.
@@ -190,10 +193,10 @@ M2 reuses the M1 scripts with per-model configs. Each model has its own `configs
 
 ```bash
 for m in pissa lora; do
-  python scripts/m1/train.py     --config configs/m2_qwen25_7b.yaml --method $m
-  python scripts/m1/eval_gsm8k.py --config configs/m2_qwen25_7b.yaml --method $m
+  python src/scripts/m1/train.py     --config configs/m2_qwen25_7b.yaml --method $m
+  python src/scripts/m1/eval_gsm8k.py --config configs/m2_qwen25_7b.yaml --method $m
 done
-python scripts/m1/plot_curves.py --config configs/m2_qwen25_7b.yaml --prefix m2_qwen25 --title "M2: Qwen2.5-7B"
+python src/scripts/m1/plot_curves.py --config configs/m2_qwen25_7b.yaml --prefix m2_qwen25 --title "M2: Qwen2.5-7B"
 ```
 
 Available M2 configs: `m2_chatglm3_6b.yaml`, `m2_qwen25_7b.yaml`, `m2_llama3_8b.yaml`, `m2_baichuan2_7b.yaml`.
@@ -205,16 +208,16 @@ Config: `configs/m3_llama2_7b.yaml`. **QPiSSA** loads in fp16 → SVD → NF4-qu
 
 ```bash
 # Table 4: NF4 reconstruction-error comparison (pure compute, no training)
-python scripts/m3/table4.py --config configs/m3_llama2_7b.yaml
+python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml
 
 # Train + eval both methods
 for m in qpissa qlora; do
-  python scripts/m1/train.py     --config configs/m3_llama2_7b.yaml --method $m
-  python scripts/m1/eval_gsm8k.py --config configs/m3_llama2_7b.yaml --method $m
+  python src/scripts/m1/train.py     --config configs/m3_llama2_7b.yaml --method $m
+  python src/scripts/m1/eval_gsm8k.py --config configs/m3_llama2_7b.yaml --method $m
 done
 
 # Plot (auto-detects qpissa/qlora)
-python scripts/m1/plot_curves.py --config configs/m3_llama2_7b.yaml --prefix m3_qpissa --title "M3: LLaMA-2-7B 4-bit"
+python src/scripts/m1/plot_curves.py --config configs/m3_llama2_7b.yaml --prefix m3_qpissa --title "M3: LLaMA-2-7B 4-bit"
 ```
 
 Note: QLoRA cannot be merged into a plain `nn.Linear` (4-bit base), so its training saves the LoRA adapter weights separately under `checkpoints/m3_qpissa/qlora/lora_weights/`; the eval script reloads the 4-bit base, re-injects QLoRA, and loads those adapter weights.

@@ -1,7 +1,7 @@
-"""M0 non-quantized W/residual spectra and element distributions.
+"""M0：展示未量化权重与残差的奇异值谱及元素分布。
 
-Strict target matching; real-input failures never silently become random input.
-Local safetensors load one tensor, not an entire model. No paper files are written.
+严格匹配目标键，真实输入失败不会静默变成随机输入。本地 safetensors 只读取
+单个张量，不加载整个模型；不写论文文件。
 """
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ _ST_DTYPE = {"F64": torch.float64, "F32": torch.float32,
 
 
 def _base_url(source, repo):
+    """按选定平台和仓库 ID 生成 safetensors 文件解析地址前缀。"""
     if source == "modelscope":
         return f"https://modelscope.cn/models/{repo}/resolve/master"
     if source == "hf":
@@ -37,6 +38,7 @@ def _base_url(source, repo):
 
 
 def _filename(name):
+    """校验远端分片名为安全相对路径，拒绝绝对路径及目录穿越。"""
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts or "\\" in name or ":" in name:
         raise ValueError("unsafe shard filename")
@@ -44,7 +46,10 @@ def _filename(name):
 
 
 def _range_get(url, start, end, timeout=30, *, retries=2, etag_state=None, trace=None):
-    """Bounded streamed [start,end] read; retry transport/transient HTTP only."""
+    """流式读取有界闭区间 [start, end]，只重试传输错误和临时 HTTP 错误。
+
+    要求响应满足 Range 协议并受长度限制；记录请求轨迹与 ETag 一致性信息。
+    """
     import requests
     if start < 0 or end < start or retries < 0:
         raise ValueError("invalid range/retry count")
@@ -102,6 +107,7 @@ def _range_get(url, start, end, timeout=30, *, retries=2, etag_state=None, trace
 
 
 def _index_json(url, retries=2, trace=None):
+    """读取并校验受限大小的 safetensors 索引；索引不存在时返回 None。"""
     import requests
     for attempt in range(retries+1):
         response = None
@@ -138,6 +144,7 @@ def _index_json(url, retries=2, trace=None):
 
 
 def _resolve_key(base, layer, *, retries=2, trace=None):
+    """严格按指定权重键定位分片，不将未命中键替换为其他层。"""
     key = layer if layer.endswith(".weight") else layer+".weight"
     index = _index_json(base+"/model.safetensors.index.json", retries, trace)
     if index is None:
@@ -149,6 +156,7 @@ def _resolve_key(base, layer, *, retries=2, trace=None):
 
 
 def _load_tensor_via_range(base, filename, key, *, retries=2, trace=None):
+    """按 safetensors 头部定位单张量字节，读取并返回浮点权重及来源信息。"""
     url = f"{base}/{_filename(filename)}"
     state = {}
     get = lambda start, end: _range_get(url, start, end, retries=retries, etag_state=state, trace=trace)
@@ -176,6 +184,7 @@ def _load_tensor_via_range(base, filename, key, *, retries=2, trace=None):
 
 
 def load_local_weight(path, key):
+    """从本地 safetensors 单文件或分片目录读取指定张量，返回权重及来源信息。"""
     from safetensors import safe_open
     path = Path(path).resolve()
     key = key if key.endswith(".weight") else key+".weight"
@@ -207,6 +216,10 @@ def load_local_weight(path, key):
 
 
 def load_weight(args):
+    """按随机、本地或远端模式加载单层权重，返回张量与可追溯来源。
+
+    远端失败仅在显式允许时使用随机回退，并记录全部失败；不把随机输入当模型证据。
+    """
     if args.random:
         with seeded(args.seed):
             weight = torch.randn(args.out_features, args.in_features)
@@ -236,6 +249,14 @@ def load_weight(args):
 
 
 def main(argv=None):
+    """绘制未量化权重和残差的谱及元素分布，保存来源报告与图片，返回退出码。
+
+    Args:
+        argv: 可选参数列表；None 时读取进程参数。真实权重模式可能发起网络请求。
+
+    Returns:
+        成功为 0，执行异常为 1；非法参数由解析器以 64 退出。
+    """
     parser = ArgumentParser64(description="Strict W/residual spectra and element distributions")
     parser.add_argument("--model", default="Qwen/Qwen3.5-2B-Base")
     parser.add_argument("--layer", default=None)
@@ -290,6 +311,7 @@ def main(argv=None):
         wc, _ = np.histogram(w, bins)
         rc, _ = np.histogram(res, bins)
         def stats(array):
+            """计算数组的均值、总体标准差、最大绝对值及元素数，转换为 JSON 兼容类型。"""
             return {"mean": float(np.mean(array, dtype=np.float64)),
                 "std_population": float(np.std(array, dtype=np.float64)),
                 "max_abs": float(np.max(np.abs(array))), "elements": int(array.size)}
