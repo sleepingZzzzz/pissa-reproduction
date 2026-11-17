@@ -1,0 +1,94 @@
+# M1 论文严格对齐配置（max_seq_len=512）。
+# 对齐依据：论文 arXiv:2404.02948v4 §5 / Appendix D；训练参考官方仓库 9633d875，评测参考 f7509eee。
+# 论文与脚本冲突时以论文文字为准；与论文设置不同之处在下方逐条注明
+# “原始设置 / 本地设置 / 原因 / 影响”，供复现后归因（HANDOFF P10）。
+# 扩展实验请用 configs/ 下的其他配置，不要改本文件来做探索。
+# 自包含，不依赖 base.yaml。
+
+experiment: m1_llama2_7b_paper512
+
+model:
+  name: Llama-2-7b
+  source: modelscope
+  ms_repo: modelscope/Llama-2-7b-ms
+  hf_repo: meta-llama/Llama-2-7b-hf
+  cache_dir: data/m1/models
+  # 偏差：官方使用 HF 原版 LLaMA-2-7B；此处为 ModelScope 镜像（权重一致性未核验）。
+
+data:
+  source: modelscope
+  metamath_ms_repo: swift/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  # 官方：train[:100000]；本地用 swift/MetaMathQA（ModelScope 官方，395K，列 query/response/type）的前 100K。
+  # 已核对：第一条与 HF meta-math/MetaMathQA 完全一致，前 100K 条回答均含 "The answer is: "；其余行序未逐条核验。
+  # 注意：AI-ModelScope/MetaMathQA 是第三方另一份数据（200K，无该后缀），不可使用。
+  num_train_samples: 100000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # 官方 main 分支脚本为 Fast SVD niter=16；论文文字的具体取值未核验。
+  niter: 16
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  # 有效 batch = per_device_batch * grad_accum = 128（见 methods）。
+
+train:
+  num_epochs: 1
+  max_seq_len: 512           # 论文设置；1024 对照见 m1_llama2_7b_len1024.yaml
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+  # 偏差：官方未显式关闭 TF32 的记录未核验；此处开启 TF32 以提速。
+  # 影响：FP32 矩阵乘精度略低，预计对结果影响很小；需要时可用 --set train.tf32=false 关闭。
+  tf32: true
+
+# 精度（论文 §5 / Appendix D）：LoRA/PiSSA 为 FP32 基座与适配器，Full-FT 为 BF16。
+# 偏差：官方为 8 卡 DeepSpeed 数据并行；此处单卡 + 梯度累积凑出同样的有效 batch 128，
+# per_device_batch 因显存/吞吐选择，不等于官方每卡 batch。
+# 偏差：本地为 T1 丢尾窗口 / T4 零监督过滤 / T5 窗口内按有效 token 等权，与官方逐 micro-batch 平均略有不同。
+methods:
+  pissa:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw          # 官方 adamw_torch
+    grad_checkpointing: true  # 偏差：官方是否开启未核验；为避免 FP32 激活 OOM 而开启，不改变数学结果
+    learning_rate: null
+  lora:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  full:
+    dtype: bfloat16           # 论文 Full-FT 精度
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw          # 官方 adamw_torch；不使用 8bit 优化器
+    grad_checkpointing: true
+    learning_rate: null
+    # 偏差：官方 DeepSpeed 的 BF16 主权重行为未核验；纯 BF16 权重 + AdamW 可能舍入掉较小更新。
+
+eval:
+  max_new_tokens: 1024        # 官方评测 max_tokens=1024
+  batch_size: 16
+  stop_strings: official_f7509eee
+  # 偏差：官方为 vLLM 0.6.2；本地 vLLM 0.10.2（独立 venv）或 HF generate，二者均不保证逐 token 一致。
+
+paths:
+  output_dir: results/paper/m1_len512
+  ckpt_dir: checkpoints/paper/m1_len512

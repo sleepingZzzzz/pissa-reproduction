@@ -17,7 +17,7 @@ model:
 data:
   source: modelscope                  # modelscope 或 hf
   # 训练集：MetaMathQA
-  metamath_ms_repo: AI-ModelScope/MetaMathQA
+  metamath_ms_repo: swift/MetaMathQA
   metamath_hf_repo: meta-math/MetaMathQA
   # 评测集：GSM8K（test，1319 题）
   gsm8k_ms_repo: modelscope/gsm8k
@@ -50,7 +50,7 @@ optim:
   weight_decay: 0.0
   lr_scheduler: cosine
   warmup_ratio: 0.03
-  global_batch_size: 128   # 全局 batch，由 per_device_batch * grad_accum 凑出
+  # 有效 batch = methods.<m>.per_device_batch * grad_accum（=128）
 
 # ---- 训练通用 ----
 train:

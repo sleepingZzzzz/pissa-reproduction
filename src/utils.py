@@ -22,7 +22,40 @@ def load_config(path: str | Path) -> dict[str, Any]:
         YAML 解析结果。调用方预期为字典；空文件实际返回 None。
     """
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    if not isinstance(cfg, dict):
+        raise ValueError(f"配置文件顶层必须是字典，收到 {type(cfg).__name__}：{path}")
+    return cfg
+
+
+def apply_overrides(cfg: dict[str, Any], assignments: list[str] | None) -> dict[str, Any]:
+    """按 ``a.b.c=值`` 形式就地覆盖配置字段，值按 YAML 字面量解析。
+
+    Args:
+        cfg: 已加载的配置字典；被原地修改。
+        assignments: 形如 ``methods.pissa.dtype=bfloat16`` 的字符串列表。
+
+    Returns:
+        同一个 cfg。路径中间节点必须已存在且为字典，叶子字段必须已存在，
+        避免拼写错误悄悄新增字段。
+
+    Raises:
+        ValueError: 格式错误或路径不存在。
+    """
+    for item in assignments or []:
+        if "=" not in item:
+            raise ValueError(f"覆盖项必须形如 key=value，收到 {item!r}")
+        key, raw = item.split("=", 1)
+        parts = key.strip().split(".")
+        node = cfg
+        for p in parts[:-1]:
+            if not isinstance(node, dict) or p not in node:
+                raise ValueError(f"覆盖路径不存在：{key}")
+            node = node[p]
+        if not isinstance(node, dict) or parts[-1] not in node:
+            raise ValueError(f"覆盖路径不存在：{key}")
+        node[parts[-1]] = yaml.safe_load(raw)
+    return cfg
 
 
 def set_seed(seed: int) -> None:
