@@ -1,62 +1,99 @@
-"""既有 QPiSSA 层：对冻结残差进行 NF4 量化。
+"""QPiSSA 层：FP32 A/B + 由 bitsandbytes ``Linear4bit`` 管理的 NF4 冻结残差基座。
 
-打包数据、absmax 与码本保存在 CPU 普通属性中，不注册为 buffer，避免 .to()
-改变打包数据的类型；前向时手动迁移并解量化。原浮点 residual buffer 仍保留。
-量化实现改进属于第四阶段，本次仅整理文档。
+初始化协议（对齐官方 ``init_qpissa.py``，HANDOFF P6/P7）：
+
+    阶段一（初始化，FP32，关闭 double quant）：外层交替迭代 ``rounds`` 轮
+        Q_0 = 0
+        B_t A_t = SVD_r(W - Q_{t-1});  R_t = W - B_t A_t;  Q_t = DQ(NF4(R_t))
+    阶段二（训练加载，官方流程）：把 Q_T 转为 BF16，再以训练量化设置
+        （默认 double quant 开启、compute dtype BF16）重新量化为 Linear4bit。
+        因此训练基座一般不等于 Q_T，二者偏差记录在 ``init_report``。
+
+``rounds=1`` 即只做一次 SVD 后量化残差的基线；外层轮数 ``rounds`` 与 Fast SVD 的
+``niter``（幂迭代次数）是两个独立概念。完整浮点残差不被持久保存：量化就绪后，
+本层只持有 Linear4bit 与 FP32 的 A/B。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import bitsandbytes as bnb
-from bitsandbytes.functional import QuantState
 
-from .layer import PiSSALinear
+from adapters.base import LowRankAdapterBase, validate_rank_alpha
+from adapters.quant import build_linear4bit, dequantize_linear4bit, local_rng, nf4_roundtrip
 from .svd_init import pissa_init
 
 
-class NFPiSSALinear(PiSSALinear):
-    """对冻结残差做 NF4 量化的既有 PiSSA 层，保留普通精度 A/B。
+@dataclass
+class QPiSSAInit:
+    """交替初始化的结果（均为 FP32，位于输入权重所在设备）。
 
-    打包权重及量化元数据放在 CPU 普通属性中，不随 .to(...) 自动迁移。
-    原 residual buffer 仍被保留；本次不改变其存储或序列化设计。
+    Attributes:
+        lora_A: ``(r, in)``，最后一轮 SVD 的右因子。
+        lora_B: ``(out, r)``，最后一轮 SVD 的左因子。
+        quantized_residual: ``Q_T = DQ(NF4(R_T))``，反量化后的 FP32 残差。
+        round_errors: 每轮 ``||R_t - Q_t||_F / ||W||_F`` 与
+            ``||W - Q_t - B_t A_t||_F / ||W||_F``（二者相等，均为该轮量化残差误差）。
     """
 
-    _nf4_ready: bool
-    residual_nf4: torch.Tensor      # CPU uint8 packed NF4 weights
-    residual_absmax: torch.Tensor   # CPU float
-    residual_code: torch.Tensor     # CPU float (codebook)
-    _nf4_shape_0: int
-    _nf4_shape_1: int
-    _nf4_dtype: str
+    lora_A: torch.Tensor
+    lora_B: torch.Tensor
+    quantized_residual: torch.Tensor
+    round_errors: list[float] = field(default_factory=list)
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        r: int,
-        alpha: float | None = None,
-        bias: torch.Tensor | None = None,
-    ) -> None:
-        """创建普通 PiSSA 存储和未就绪的 CPU 量化属性。
 
-        Args:
-            in_features: 输入维度。
-            out_features: 输出维度。
-            r: 适配器秩。
-            alpha: None 或 r，沿用父类限制。
-            bias: 可选冻结偏置。
-        """
-        super().__init__(in_features, out_features, r, alpha, bias)
-        self._nf4_ready = False
-        self.residual_nf4 = torch.empty(0, dtype=torch.uint8)
-        self.residual_absmax = torch.empty(0)
-        self.residual_code = torch.empty(0)
-        self._nf4_shape_0 = 0
-        self._nf4_shape_1 = 0
-        self._nf4_dtype = ""
+@torch.no_grad()
+def qpissa_alternating_init(
+    weight: torch.Tensor,
+    r: int,
+    rounds: int = 1,
+    niter: int | None = None,
+    double_quant: bool = False,
+    seed: int | None = None,
+) -> QPiSSAInit:
+    """对单个权重做 QPiSSA 外层交替初始化。
+
+    Args:
+        weight: ``(out, in)`` 权重；先转为 FP32 计算，不原地修改。
+        r: 适配器秩。
+        rounds: 外层交替轮数（>=1）；1 为一次 SVD 后量化残差的基线，论文配置为 5。
+        niter: None 为精确 SVD；整数为 Fast SVD 的幂迭代次数（与 ``rounds`` 无关）。
+        double_quant: 初始化阶段是否对 NF4 absmax 做嵌套量化；协议为 False。
+        seed: 非 None 时用局部 RNG 固定 Fast SVD 的随机抽样，不影响全局 RNG。
+
+    Returns:
+        QPiSSAInit。后续轮的 A/B 不再是 W 的前 r 个主成分（它们是 ``W - Q_{t-1}`` 的主成分）。
+
+    Raises:
+        ValueError: ``rounds`` 不是正整数，或 r 越界。
+    """
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        raise ValueError(f"rounds 必须是 >=1 的整数，收到 {rounds!r}")
+    W = weight.detach().to(torch.float32)
+    w_norm = torch.linalg.norm(W).clamp_min(1e-30)
+    Q = torch.zeros_like(W)
+    A = B = None
+    errors: list[float] = []
+    for _ in range(rounds):
+        with local_rng(seed, W.device):
+            init = pissa_init(W - Q, r=r, niter=niter)
+        A, B = init.lora_A, init.lora_B
+        R = W - B @ A
+        Q = nf4_roundtrip(R, compress_statistics=double_quant)
+        errors.append(float(torch.linalg.norm(R - Q) / w_norm))
+    return QPiSSAInit(lora_A=A, lora_B=B, quantized_residual=Q, round_errors=errors)
+
+
+class NFPiSSALinear(LowRankAdapterBase):
+    """QPiSSA 层：``y = base4bit(x) + scaling * B(A(x))``，base 为量化残差。
+
+    本类不再继承 ``PiSSALinear``，也不持有完整浮点残差；合并请使用
+    ``pissa.inject_nf4.merge_qpissa``。
+    """
+
+    init_report: dict
 
     @classmethod
     def from_linear(
@@ -64,101 +101,91 @@ class NFPiSSALinear(PiSSALinear):
         linear: nn.Linear,
         r: int,
         alpha: float | None = None,
+        *,
+        rounds: int = 1,
         niter: int | None = None,
+        compute_dtype: torch.dtype = torch.bfloat16,
+        double_quant: bool = True,
+        init_double_quant: bool = False,
+        adapter_dtype: torch.dtype = torch.float32,
+        base_dtype: torch.dtype = torch.bfloat16,
+        device: torch.device | str | None = None,
+        seed: int | None = None,
     ) -> "NFPiSSALinear":
-        """从线性层执行 SVD、复制初始化结果，再量化残差。
+        """从浮点线性层做交替初始化并构造量化基座层，不修改源层。
 
         Args:
-            linear: 源线性层，不原地修改。
-            r: 适配器秩。
-            alpha: None 或 r。
-            niter: None 为精确 SVD，整数为 Fast SVD 幂迭代次数。
+            linear: 未量化的浮点源 ``nn.Linear``。
+            r: 适配器秩，须满足 ``0 < r <= min(in, out)``。
+            alpha: None 或 r；PiSSA 要求 alpha == r。
+            rounds: 外层交替轮数。
+            niter: Fast SVD 幂迭代次数，None 为精确 SVD。
+            compute_dtype: 训练阶段 Linear4bit 的计算精度。
+            double_quant: 训练阶段重新量化时是否开启 double quant（官方默认开启）。
+            init_double_quant: 初始化阶段是否开启 double quant（协议为 False）。
+            adapter_dtype: A/B 存储精度（论文：FP32）。
+            base_dtype: 把 ``Q_T`` 转成该精度后再重新量化（官方训练加载阶段为 BF16）。
+            device: CUDA 设备，None 时取源权重设备。
+            seed: Fast SVD 的局部随机种子。
 
         Returns:
-            新量化 PiSSA 层；沿用先默认设备和精度分配再复制的既有行为，
-            注入调用方随后迁移设备和精度。此处不声称与源层逐位等价。
+            量化就绪的层；``init_report`` 记录每轮误差、重构误差及训练基座与 ``Q_T`` 的偏差。
+
+        Raises:
+            TypeError: 源层是量化层或权重非浮点。
+            ValueError: 参数不合法。
         """
-        init = pissa_init(linear.weight.data, r=r, niter=niter)
-        module = cls(
-            in_features=linear.in_features,
-            out_features=linear.out_features,
-            r=r,
-            alpha=alpha,
-            bias=linear.bias.data.clone() if linear.bias is not None else None,
+        if not isinstance(linear, nn.Linear) or not linear.weight.is_floating_point():
+            raise TypeError(f"QPiSSA 需要未量化的浮点 nn.Linear，收到 {type(linear).__name__}")
+        if {"Linear4bit", "Linear8bitLt"} & {c.__name__ for c in type(linear).__mro__}:
+            raise TypeError("QPiSSA 不能对已量化层做初始化。")
+        r, alpha_val = validate_rank_alpha(r, alpha)
+        if alpha_val != float(r):
+            raise ValueError(f"QPiSSA 要求 alpha == r（scaling = 1），收到 alpha={alpha!r}, r={r}")
+        dev = torch.device(device) if device is not None else linear.weight.device
+
+        W = linear.weight.detach().to(dev, torch.float32)
+        init = qpissa_alternating_init(W, r, rounds=rounds, niter=niter, double_quant=init_double_quant, seed=seed)
+        bias = linear.bias.detach() if linear.bias is not None else None
+        base = build_linear4bit(
+            init.quantized_residual.to(base_dtype), bias, compute_dtype, double_quant, dev,
         )
+        layer = cls(base, linear.in_features, linear.out_features, r, alpha_val, dtype=adapter_dtype, device=dev)
         with torch.no_grad():
-            module.lora_A.copy_(init.lora_A)
-            module.lora_B.copy_(init.lora_B)
-            module.residual.copy_(init.residual)
-        del init
-
-        module.quantize_residual()
-        return module
-
-    @torch.no_grad()
-    def quantize_residual(self) -> None:
-        """将残差转为 CPU float32 做 NF4 量化，并缓存打包数据。
-
-        已就绪时直接返回；原 residual buffer 仍保留，不在此处释放。
-        量化数据、absmax 与码本作为普通属性保存，不自动进入 state_dict。
-        """
-        if self._nf4_ready:
-            return
-        # 搬到 CPU 做 NF4 量化
-        W = self.residual.data.float().cpu()
-        W_nf4, qs = bnb.functional.quantize_nf4(W)
-
-        # 全部存为纯 Python 属性（CPU），不注册 buffer → model.to() 不会碰
-        self.residual_nf4 = W_nf4         # CPU, uint8
-        self.residual_absmax = qs.absmax  # CPU
-        self.residual_code = qs.code      # CPU
-        self._nf4_shape_0 = qs.shape[0]
-        self._nf4_shape_1 = qs.shape[1]
-        self._nf4_dtype = str(self.residual.dtype)
-        self._nf4_ready = True
-
-        # 注意：不释放 self.residual buffer。它作为 registered buffer 参与
-        # state_dict / model.to() 等流程；强行改 shape 会破坏 PyTorch 内部状态。
-
-    def _dequant_residual(self) -> torch.Tensor:
-        """在 A 的设备上重建 QuantState 并解量化，返回 A 精度的残差。
-
-        量化尚未就绪时直接返回原 residual；就绪时每次调用都搬运并解量化。
-        """
-        if not self._nf4_ready:
-            return self.residual
-        device = self.lora_A.device
-        qs = QuantState(
-            absmax=self.residual_absmax.to(device),
-            shape=torch.Size([self._nf4_shape_0, self._nf4_shape_1]),
-            code=self.residual_code.to(device),
-            blocksize=64,
-            quant_type="nf4",
-            dtype=getattr(torch, self._nf4_dtype.split(".")[-1]) if self._nf4_dtype else torch.float16,
-            offset=None,
-            state2=None,
-        )
-        nf4_dev = self.residual_nf4.to(device)
-        residual_dq = bnb.functional.dequantize_nf4(nf4_dev, qs)
-        return residual_dq.to(self.lora_A.dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """以解量化残差计算基座映射，再加低秩增量，输出形状 (..., out)。"""
-        residual_fp = self._dequant_residual()
-        base = F.linear(x, residual_fp, self.bias)
-        delta = F.linear(F.linear(x, self.lora_A), self.lora_B)
-        return base + self.scaling * delta
+            layer.lora_A.copy_(init.lora_A)
+            layer.lora_B.copy_(init.lora_B)
+            q_train = dequantize_linear4bit(base).float()
+            denom = torch.linalg.norm(init.quantized_residual).clamp_min(1e-30)
+            requant_dev = float(torch.linalg.norm(q_train - init.quantized_residual) / denom)
+            recon = q_train + layer.scaling * (layer.lora_B.float() @ layer.lora_A.float())
+            recon_err = float(torch.linalg.norm(recon - W) / torch.linalg.norm(W).clamp_min(1e-30))
+        layer.init_report = {
+            "rounds": rounds,
+            "round_errors": init.round_errors,
+            "requant_rel_dev_vs_Q_T": requant_dev,
+            "recon_rel_err_vs_W": recon_err,
+        }
+        return layer
 
     @torch.no_grad()
     def merged_weight(self) -> torch.Tensor:
-        """返回解量化残差加缩放 B @ A；结果通常不等于量化前源权重。"""
-        return self._dequant_residual() + self.scaling * (self.lora_B @ self.lora_A)
+        """返回 FP32 的 ``dequant(base) + scaling * B @ A``；通常不等于量化前源权重。"""
+        return dequantize_linear4bit(self.base).float() + self.scaling * (
+            self.lora_B.float() @ self.lora_A.float()
+        )
 
     @torch.no_grad()
-    def to_linear(self) -> nn.Linear:
-        """将解量化后的等效权重复制到默认设备和精度创建的新 nn.Linear。"""
-        linear = nn.Linear(self.in_features, self.out_features, bias=self.bias is not None)
-        linear.weight.data.copy_(self.merged_weight())
-        if self.bias is not None:
-            linear.bias.data.copy_(self.bias)
-        return linear
+    def to_linear(self, dtype: torch.dtype = torch.float32) -> nn.Linear:
+        """把等效权重复制到本层所在设备上新建的 ``nn.Linear``（默认 FP32）。
+
+        在 meta 设备上构造再 ``to_empty``，不消耗任何随机数。
+        """
+        device = self.lora_A.device
+        with torch.device("meta"):
+            linear = nn.Linear(self.in_features, self.out_features, bias=self.base.bias is not None)
+        linear = linear.to_empty(device=device)
+        linear.weight.data.copy_(self.merged_weight().to(dtype))
+        if self.base.bias is not None:
+            linear.bias = nn.Parameter(self.base.bias.detach().to(device, dtype).clone())
+        linear.weight.requires_grad_(False)
+        return linear.to(dtype)

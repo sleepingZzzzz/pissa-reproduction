@@ -1,0 +1,31 @@
+# M3 Table 4（量化重建误差）参考配置：LLaMA-2-7B，只做初始化阶段的量化误差测量，不训练。
+# 协议（HANDOFF P6/P7）：FP32 计算；NF4、blocksize 64；初始化阶段关闭 double quant；
+# QPiSSA 为外层交替初始化，轮数用命令行 --rounds 指定（1 轮 = 一次 SVD 后量化残差的基线；论文配置 5 轮）。
+#   python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 1
+#   python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 5
+# 本配置自包含，不依赖 base.yaml。
+
+experiment: m3_table4_llama2_7b
+
+model:
+  name: Llama-2-7b
+  source: local
+  # 与 M1 共用的 ModelScope 镜像本地快照（偏差：官方用 HF 原版权重，一致性未核验）。
+  local_path: data/m1/models/models/modelscope--Llama-2-7b-ms/snapshots/master
+
+quantization:
+  quant_type_note: "NF4 固定；blocksize 固定为 bitsandbytes 默认 64"
+  init_double_quant: false     # 初始化阶段关闭（官方 init_qpissa.py）；训练加载阶段的 double quant 不属于本测量
+  # 以下训练阶段键不被 table4.py 使用，列出以便与训练配置对照：
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+
+adapter:
+  r: 128
+  alpha: 128
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  niter: null                  # null = 精确 SVD（本地 10.71% 的历史结果即精确 SVD）；Fast SVD 的幂迭代次数，与 init_rounds 无关
+  init_rounds: 5               # QPiSSA 外层交替轮数；命令行 --rounds 可覆盖
+
+paths:
+  output_dir: results/paper/m3_table4

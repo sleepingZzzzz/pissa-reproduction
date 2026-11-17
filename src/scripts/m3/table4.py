@@ -1,21 +1,28 @@
 """[M3] Table 4：量化重建误差对比（QPiSSA vs QLoRA），对齐原论文口径。
 
 度量与原文 (PiSSA, NeurIPS 2024, Table 4) 一致：
-  量化误差降低率 = (1 - ||W_res - nf4(W_res)||_* / ||W - nf4(W)||_*) * 100%
-其中 ||·||_* 为**核范数**（nuclear / 奇异值之和）。按投影类型 (Q/K/V/O/Gate/Up/Down)
-分组、跨全部层求平均，AVG = 各投影类型平均值的均值（与原文表头一致）。
+  量化误差降低率 = (1 - ||W - Q_T - B_T A_T||_* / ||W - nf4(W)||_*) * 100%
+其中 ||·||_* 为核范数（奇异值之和）。QPiSSA 项等于 ``||R_T - Q_T||_*``。
+按投影类型分组、跨层求平均，AVG = 各投影类型平均值的均值。同时保留 Frobenius 口径作参考。
 
-同时保留 Frobenius 范数下的降低率作参考（旧口径，便于对照历史结果）。
+协议（HANDOFF P6/P7）：
+  - FP32 计算，NF4、blocksize 64，初始化阶段关闭 double quant（``quantization.init_double_quant``）；
+  - QPiSSA 为外层交替初始化，轮数由 ``--rounds`` 或 ``adapter.init_rounds`` 给出
+    （1 轮为一次 SVD 后量化残差的基线，论文 Table 8 的 10.7 对应 1 轮，论文配置为 5 轮）；
+    与 Fast SVD 的 ``adapter.niter`` 无关；
+  - 本脚本测的是初始化阶段的量化重建误差，不包含训练加载阶段的 BF16 + double quant 重新量化。
 
 用法（需基座模型权重 + CUDA；纯前向计算，不训练）：
-    python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml          # 全部层（对齐原文）
-    python src/scripts/m3/table4.py --config configs/m3_llama2_7b.yaml --layers 2  # 冒烟（前 2 层）
+    python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 1
+    python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 5
+    python src/scripts/m3/table4.py --config ... --layers 2   # 冒烟：只测前 2 个匹配的 Linear 模块
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime
@@ -23,29 +30,17 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import bitsandbytes as bnb
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from pissa import PiSSALinear, inject_pissa, merge_pissa
-from pissa.svd_init import pissa_init, reconstruction_error_against
+from adapters.quant import nf4_roundtrip
+from pissa.layer_nf4 import qpissa_alternating_init
 
-from utils import abspath, load_config, torch_dtype
+from utils import abspath, apply_overrides, load_config
 from scripts.model_ops import resolve_model_path
 
-# PiSSA 初始化的 loRA_A/loRA_B 命名
-LORA_A = "lora_A"
-LORA_B = "lora_B"
-
-
-def nf4_quant_dequant(w: torch.Tensor, compute_dtype=torch.float32) -> torch.Tensor:
-    """NF4 量化→反量化。返回反量化浮点张量。"""
-    w_fp = w.to(dtype=compute_dtype, copy=True).detach()
-    # bitsandbytes 的 NF4 量化接口
-    w_nf4, quant_state = bnb.functional.quantize_nf4(w_fp)
-    w_dq = bnb.functional.dequantize_nf4(w_nf4, quant_state)
-    return w_dq.to(dtype=w.dtype)
+ORDER = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 
 def nuclear_norm(m: torch.Tensor) -> float:
@@ -55,155 +50,167 @@ def nuclear_norm(m: torch.Tensor) -> float:
 
 def linear_layers(model: nn.Module, target_modules: tuple[str, ...]) -> list[tuple[str, nn.Linear]]:
     """按目标模块叶名称收集 nn.Linear，返回 (完整名称, 模块) 列表。"""
-    return [
-        (n, m) for n, m in model.named_modules()
-        if isinstance(m, nn.Linear) and n.rsplit(".", 1)[-1] in target_modules
-    ]
+    return [(n, m) for n, m in model.named_modules()
+            if isinstance(m, nn.Linear) and n.rsplit(".", 1)[-1] in target_modules]
+
+
+def reduction_pct(base_err: float, qpissa_err: float) -> tuple[float | None, str]:
+    """降低率 (1 - qpissa/base)*100 及状态。
+
+    base_err == 0 时相对降低率未定义（不再用 1e-12 夹紧）；任一误差非有限则无效；
+    base>0 且 qpissa==0 时允许有效的 100%；允许合法的负降低率。
+    """
+    if not (math.isfinite(base_err) and math.isfinite(qpissa_err)):
+        return None, "non_finite"
+    if base_err == 0.0:
+        return None, "undefined_zero_baseline"
+    return (1.0 - qpissa_err / base_err) * 100.0, "ok"
+
+
+def summarize(valid: list[dict]) -> dict:
+    """用未舍入的值做模块 → 类型平均 → 类型等权 AVG 汇总。"""
+    by_nuc: dict[str, list[float]] = defaultdict(list)
+    by_fro: dict[str, list[float]] = defaultdict(list)
+    for rec in valid:
+        if rec["reduction_pct_nuclear"] is not None:
+            by_nuc[rec["proj_type"]].append(rec["reduction_pct_nuclear"])
+        if rec["reduction_pct_frobenius"] is not None:
+            by_fro[rec["proj_type"]].append(rec["reduction_pct_frobenius"])
+    types = [t for t in ORDER if t in by_nuc] + sorted(t for t in by_nuc if t not in ORDER)
+    per_nuc = {t: sum(by_nuc[t]) / len(by_nuc[t]) for t in types}
+    per_fro = {t: sum(by_fro[t]) / len(by_fro[t]) for t in types if by_fro.get(t)}
+    return {
+        "reduction_pct_nuclear_by_type": per_nuc,
+        "reduction_pct_nuclear_AVG": sum(per_nuc.values()) / len(per_nuc) if per_nuc else None,
+        "reduction_pct_frobenius_by_type": per_fro,
+        "reduction_pct_frobenius_AVG": sum(per_fro.values()) / len(per_fro) if per_fro else None,
+    }
 
 
 def main() -> None:
     """加载基座并计算逐投影类型的 NF4 误差统计，保存 Table 4 指标；不执行训练。"""
     parser = argparse.ArgumentParser(description="[M3] Table 4 量化误差")
-    parser.add_argument("--config", default="configs/m3_llama2_7b.yaml")
-    parser.add_argument("--layers", type=int, default=None, help="只测前 N 层（冒烟）")
+    parser.add_argument("--config", default="configs/paper/m3_table4_llama2_7b.yaml")
+    parser.add_argument("--rounds", type=int, default=None, help="QPiSSA 外层交替轮数；缺省取 adapter.init_rounds")
+    parser.add_argument("--layers", type=int, default=None,
+                        help="只测前 N 个匹配的 Linear 模块（按模块数量，不是 transformer block 数；冒烟用）")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
+    parser.add_argument("--overwrite", action="store_true", help="允许覆盖同名产物")
     args = parser.parse_args()
+    if args.layers is not None and args.layers <= 0:
+        raise SystemExit("--layers 必须是正整数。")
 
     cfg = load_config(abspath(args.config))
+    apply_overrides(cfg, args.set)
+    acfg, qcfg = cfg["adapter"], cfg["quantization"]
+    rounds = args.rounds if args.rounds is not None else acfg.get("init_rounds", 1)
+    if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 1:
+        raise SystemExit(f"轮数必须是 >=1 的整数，收到 {rounds!r}")
+    init_dq = bool(qcfg.get("init_double_quant", False))
+    niter = acfg.get("niter")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model_path = resolve_model_path(cfg)
-    dtype = torch.float32  # 误差计算用 fp32
+    if not torch.cuda.is_available():
+        raise SystemExit("Table 4 需要 CUDA（bitsandbytes NF4）。")
+    device = "cuda"
+    out_dir = abspath(cfg["paths"]["output_dir"])
+    scope = "full" if args.layers is None else f"layers{args.layers}"
+    out_path = out_dir / f"table4_quant_error_rounds{rounds}_{scope}.json"
+    if out_path.exists() and not args.overwrite:
+        raise SystemExit(f"已存在 {out_path}；请显式传 --overwrite。")
 
-    # 加载模型（不含量化）
     from transformers import AutoModelForCausalLM
 
-    print(f"加载模型 {model_path} ...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=dtype, low_cpu_mem_usage=True
-    ).to(device)
+    model_path = resolve_model_path(cfg)
+    print(f"加载模型 {model_path}（FP32，不含量化）...")
+    model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.float32, low_cpu_mem_usage=True).to(device)
     model.eval()
 
-    target_modules = tuple(cfg["adapter"]["target_modules"])
-    r = cfg["adapter"]["r"]
-    qcfg = cfg["quantization"]
-    compute_dtype = torch.float32
-
+    target_modules = tuple(acfg["target_modules"])
+    r = acfg["r"]
     lines = linear_layers(model, target_modules)
+    n_matched = len(lines)
     if args.layers:
         lines = lines[: args.layers]
-    print(f"待测线性层：{len(lines)}（target_modules={target_modules}）")
+    expected_by_type: dict[str, int] = defaultdict(int)
+    for name, _ in lines:
+        expected_by_type[name.rsplit(".", 1)[-1]] += 1
+    print(f"匹配 {n_matched} 个线性模块，本次测量 {len(lines)} 个；rounds={rounds} niter={niter} init_double_quant={init_dq}")
 
-    results = []
+    records: list[dict] = []
     for name, module in lines:
-        proj = name.rsplit(".", 1)[-1]  # 投影类型：q_proj/k_proj/.../down_proj
-        W = module.weight.data.detach().to(dtype=compute_dtype)
+        proj = name.rsplit(".", 1)[-1]
         try:
-            # === 1. 基线：NF4 直接量化原权重 W ===
-            W_q = nf4_quant_dequant(W, compute_dtype)
-
-            # === 2. PiSSA SVD 分解，得到残差 W_res ===
-            init = pissa_init(W, r=r, niter=None)
-            err_svd = reconstruction_error_against(init, W)
-            W_res = init.residual.to(dtype=compute_dtype)
-
-            # === 3. NF4 量化残差 W_res ===
-            W_res_q = nf4_quant_dequant(W_res, compute_dtype)
-
-            # === 4. 误差降低率 ===
-            #   QLoRA  误差 = ||W      - nf4(W)     ||   （baseline）
-            #   QPiSSA 误差 = ||W_res  - nf4(W_res) ||   （因 W-(nf4(W_res)+AB)=W_res-nf4(W_res)）
-            # 原文口径用核范数；同时保留 Frobenius 作参考。
-            base_nuc = nuclear_norm(W - W_q)
-            pissa_nuc = nuclear_norm(W_res - W_res_q)
-            red_nuc = (1.0 - pissa_nuc / max(base_nuc, 1e-12)) * 100.0
-
-            base_fro = (W - W_q).norm().item()
-            pissa_fro = (W_res - W_res_q).norm().item()
-            red_fro = (1.0 - pissa_fro / max(base_fro, 1e-12)) * 100.0
-
-            results.append({
-                "layer": name,
-                "proj_type": proj,
-                "in_features": module.in_features,
-                "out_features": module.out_features,
-                # 原文口径（核范数）
-                "baseline_err_nuclear": round(base_nuc, 6),
-                "pissa_err_nuclear": round(pissa_nuc, 6),
-                "reduction_pct_nuclear": round(red_nuc, 4),
-                # 参考口径（Frobenius，旧结果）
-                "baseline_err_frobenius": round(base_fro, 6),
-                "pissa_err_frobenius": round(pissa_fro, 6),
-                "reduction_pct_frobenius": round(red_fro, 4),
-                "svd_recon_err": round(err_svd, 8),
+            W = module.weight.data.detach().to(torch.float32)
+            W_q = nf4_roundtrip(W, compress_statistics=init_dq)  # QLoRA 基线：NF4(W)
+            init = qpissa_alternating_init(W, r=r, rounds=rounds, niter=niter, double_quant=init_dq)
+            E = W - (init.quantized_residual + init.lora_B @ init.lora_A)  # = R_T - Q_T
+            base_nuc, qp_nuc = nuclear_norm(W - W_q), nuclear_norm(E)
+            base_fro, qp_fro = (W - W_q).norm().item(), E.norm().item()
+            red_nuc, st_nuc = reduction_pct(base_nuc, qp_nuc)
+            red_fro, st_fro = reduction_pct(base_fro, qp_fro)
+            records.append({
+                "layer": name, "proj_type": proj,
+                "in_features": module.in_features, "out_features": module.out_features,
+                "baseline_err_nuclear": base_nuc, "qpissa_err_nuclear": qp_nuc,
+                "reduction_pct_nuclear": red_nuc, "status_nuclear": st_nuc,
+                "baseline_err_frobenius": base_fro, "qpissa_err_frobenius": qp_fro,
+                "reduction_pct_frobenius": red_fro, "status_frobenius": st_fro,
+                "round_errors_rel_fro": init.round_errors,
             })
+            shown = f"{red_nuc:5.1f}%" if red_nuc is not None else st_nuc
+            print(f"  {name}: reduction(nuc)={shown}")
+        except Exception as e:  # noqa: BLE001 - 失败逐条记录，由状态汇总暴露
+            print(f"  {name}: FAILED ({type(e).__name__}: {e})")
+            records.append({"layer": name, "proj_type": proj, "status": "failed",
+                            "error": f"{type(e).__name__}: {e}"})
 
-            print(f"  {name}: reduction(nuc)={red_nuc:5.1f}%  "
-                  f"reduction(fro)={red_fro:5.1f}%  svd_err={err_svd:.2e}")
-
-        except Exception as e:
-            print(f"  {name}: SKIP ({e})")
-            results.append({"layer": name, "proj_type": proj, "error": str(e)})
-
-    # ---- 汇总：按投影类型分组（对齐原文 Table 4）----
-    valid = [r for r in results if "reduction_pct_nuclear" in r]
-    summary = {"error": "no valid results"}
+    failed = [rec for rec in records if rec.get("status") == "failed"]
+    valid = [rec for rec in records if "status" not in rec and rec["reduction_pct_nuclear"] is not None]
+    excluded = [rec for rec in records if "status" not in rec and rec["reduction_pct_nuclear"] is None]
+    ok_by_type: dict[str, int] = defaultdict(int)
+    for rec in valid:
+        ok_by_type[rec["proj_type"]] += 1
+    covers_all = len(valid) == len(lines) and all(ok_by_type[t] == n for t, n in expected_by_type.items())
+    status = "complete" if covers_all else ("failed" if not valid else "partial")
+    summary = summarize(valid) if valid else {}
+    summary.update({
+        "metric": "quantization error reduction ratio (%) vs NF4(W) baseline",
+        "norm": "nuclear (paper) + frobenius (reference)",
+        "expected_modules": len(lines), "valid_modules": len(valid),
+        "failed_modules": len(failed), "excluded_modules": len(excluded),
+        "expected_by_type": dict(expected_by_type), "valid_by_type": dict(ok_by_type),
+        "AVG_covers_all_expected_modules": covers_all,
+    })
     if valid:
-        by_type_nuc: dict[str, list[float]] = defaultdict(list)
-        by_type_fro: dict[str, list[float]] = defaultdict(list)
-        for rec in valid:  # 不能用 r 作循环变量：会覆盖上面的 r = cfg["adapter"]["r"]
-            by_type_nuc[rec["proj_type"]].append(rec["reduction_pct_nuclear"])
-            by_type_fro[rec["proj_type"]].append(rec["reduction_pct_frobenius"])
+        print("\n=== Table 4（量化误差降低率 %，核范数口径）===  状态:", status)
+        types = list(summary["reduction_pct_nuclear_by_type"])
+        print("  " + "".join(f"{t.replace('_proj', ''):>8}" for t in types) + f"{'AVG':>8}")
+        print("nuc  " + "".join(f"{summary['reduction_pct_nuclear_by_type'][t]:>8.1f}" for t in types)
+              + f"{summary['reduction_pct_nuclear_AVG']:>8.1f}")
+        if not covers_all:
+            print("  [warn] AVG 未覆盖全部预期模块，不能当作完整结果。")
 
-        # 原文表头顺序
-        order = ["q_proj", "k_proj", "v_proj", "o_proj",
-                 "gate_proj", "up_proj", "down_proj"]
-        types = [t for t in order if t in by_type_nuc] + \
-                sorted(t for t in by_type_nuc if t not in order)
+    from scripts.m1.train import code_version, env_info
 
-        per_type_nuc = {t: round(sum(by_type_nuc[t]) / len(by_type_nuc[t]), 2) for t in types}
-        per_type_fro = {t: round(sum(by_type_fro[t]) / len(by_type_fro[t]), 2) for t in types}
-        # AVG = 各投影类型平均值的均值（与原文一致）
-        avg_nuc = round(sum(per_type_nuc.values()) / len(per_type_nuc), 2)
-        avg_fro = round(sum(per_type_fro.values()) / len(per_type_fro), 2)
-
-        summary = {
-            "metric": "quantization error reduction ratio (%) vs NF4(W) baseline",
-            "norm": "nuclear (paper) + frobenius (reference)",
-            "num_layers": len(valid),
-            "reduction_pct_nuclear_by_type": per_type_nuc,
-            "reduction_pct_nuclear_AVG": avg_nuc,
-            "reduction_pct_frobenius_by_type": per_type_fro,
-            "reduction_pct_frobenius_AVG": avg_fro,
-        }
-
-        # 终端打印一个类原文 Table 4 的小表
-        print("\n=== Table 4（量化误差降低率 %，对齐原文核范数口径）===")
-        header = "  " + "".join(f"{t.replace('_proj',''):>8}" for t in types) + f"{'AVG':>8}"
-        print(header)
-        row_nuc = "  " + "".join(f"{per_type_nuc[t]:>8.1f}" for t in types) + f"{avg_nuc:>8.1f}"
-        print(f"nuclear{row_nuc}")
-        row_fro = "  " + "".join(f"{per_type_fro[t]:>8.1f}" for t in types) + f"{avg_fro:>8.1f}"
-        print(f"froben.{row_fro}")
-
-    # ---- 保存 ----
-    out_dir = abspath(cfg["paths"]["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "table4_quant_error.json"
     payload = {
         "experiment": "M3/Table4 量化重建误差",
+        "status": status,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "config": {
-            "r": r,
-            "target_modules": list(target_modules),
-            "quant_type": qcfg["bnb_4bit_quant_type"],
-            "compute_dtype": str(compute_dtype),
+            "r": r, "target_modules": list(target_modules), "quant_type": "nf4", "blocksize": 64,
+            "init_double_quant": init_dq, "qpissa_rounds": rounds, "svd_niter": niter,
+            "measurement_precision": "float32", "scope": scope, "num_matched_modules": n_matched,
+            "config_path": str(abspath(args.config)), "overrides": args.set,
+            "code": code_version(), "env": env_info(),
         },
         "summary": summary,
-        "per_layer": results,
+        "per_layer": records,
     }
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"已保存 {out_path}")
+    if status != "complete":
+        raise SystemExit(f"Table 4 状态={status}（失败 {len(failed)}，排除 {len(excluded)}）。")
 
 
 if __name__ == "__main__":

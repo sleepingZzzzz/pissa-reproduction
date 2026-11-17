@@ -1,0 +1,88 @@
+# M3 论文版参考配置：LLaMA-3-8B、MetaMathQA 全量 395K、3 epochs、QPiSSA 5 轮交替初始化。
+# 仅作参考与键名对照，当前不运行（体量与耗时远超本地 M1 范围；运行需另行授权）。
+# 来源：论文 arXiv:2404.02948v4 §5 / Appendix D，训练参考官方仓库 9633d875。
+# 下列标注“未核验”的值来自对官方脚本的转述或本项目默认，尚未对照论文逐条确认。
+# 自包含，不依赖 base.yaml。
+
+experiment: m3_llama3_8b_reference
+
+model:
+  name: Llama-3-8B
+  source: modelscope
+  ms_repo: LLM-Research/Meta-Llama-3-8B   # 未核验：ModelScope 仓库名需在使用前确认
+  hf_repo: meta-llama/Meta-Llama-3-8B
+  cache_dir: data/m3/models
+
+data:
+  source: modelscope
+  metamath_ms_repo: swift/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: null      # 全量 395K
+
+# 量化协议（P6/P7）：初始化阶段关闭 double quant；训练加载阶段按官方默认开启，compute dtype 为 BF16。
+quantization:
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_compute_dtype: bfloat16
+  bnb_4bit_use_double_quant: true   # 训练加载阶段（官方默认）
+  init_double_quant: false          # 初始化阶段
+  train_load_dtype: bfloat16        # QPiSSA：Q_T 转为该精度后再重新量化（官方加载流程）
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  niter: 16                    # 官方 main 脚本取值；论文文字未核验
+  init_rounds: 5               # QPiSSA 外层交替轮数（与 niter 无关）；QLoRA 忽略
+
+optim:
+  learning_rate: 2.0e-5        # 未核验：沿用 M1
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+
+train:
+  num_epochs: 3
+  max_seq_len: 512
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+  tf32: true
+
+# 精度（论文 §5/Appendix D）：NF4 基座、FP32 适配器、BF16 计算。
+# 偏差：官方 QPiSSA 脚本为单卡、每卡 batch 1、累积 128；此处 per_device_batch 取 8 以提高吞吐，有效 batch 同为 128。
+methods:
+  qpissa:
+    dtype: float32             # 非量化模块（embedding/norm/lm_head）的精度
+    adapter_dtype: float32
+    autocast_dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  qlora:
+    dtype: float32
+    adapter_dtype: float32
+    autocast_dtype: bfloat16
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 1024
+  batch_size: 16
+  stop_strings: official_f7509eee
+
+paths:
+  output_dir: results/paper/m3_llama3_8b
+  ckpt_dir: checkpoints/paper/m3_llama3_8b

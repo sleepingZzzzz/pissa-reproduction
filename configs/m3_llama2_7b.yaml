@@ -16,6 +16,9 @@ quantization:
   bnb_4bit_compute_dtype: bfloat16
   bnb_4bit_use_double_quant: true
   bnb_4bit_quant_type: nf4
+  # 以下为协议键：训练加载阶段开启 double quant（官方默认），QPiSSA 初始化阶段关闭。
+  init_double_quant: false
+  train_load_dtype: bfloat16        # QPiSSA：Q_T 转为该精度后再重新量化
 
 # ---- 数据（复用 M1）----
 data:
@@ -36,7 +39,8 @@ adapter:
     - gate_proj
     - up_proj
     - down_proj
-  niter: null
+  niter: null           # Fast SVD 幂迭代次数；null=精确 SVD。与 init_rounds 无关
+  init_rounds: 1        # QPiSSA 外层交替轮数；1=一次 SVD 后量化残差（论文配置 5，见 configs/paper/）
 
 # ---- 优化器 / 调度 ----
 optim:
@@ -57,7 +61,8 @@ train:
 # ---- 方法（NF4 训练）----
 methods:
   qpissa:
-    dtype: bfloat16
+    dtype: bfloat16           # 扩展配置：非量化模块用 BF16；论文为 FP32，见 configs/paper/
+    adapter_dtype: float32
     per_device_batch: 8
     grad_accum: 16
     optimizer: adamw
@@ -65,6 +70,7 @@ methods:
     learning_rate: null
   qlora:
     dtype: bfloat16
+    adapter_dtype: float32
     per_device_batch: 8
     grad_accum: 16
     optimizer: adamw
