@@ -1,9 +1,13 @@
 """M1 实验编排：分配全局实验号 n，串行运行各步骤，并按 n 管理 logs / ckpt / results。
 
 一次启动 = 一个 n（取 logs 根目录最大 n + 1）。目录布局（创建时带 ``(fail)_``，成功后去掉）：
-    logs/(fail)_exp{n}_m1_{模型名}[_{kind}]_{MMDD_HH}/      各步骤日志 + summary.txt
-    checkpoints/{smoke,full}/(fail)_exp{n}_{MMDD_HH}/{method}/
-    results/m1/{tokenize_stats,bf16_diag,smoke,full}/(fail)_exp{n}_{MMDD_HH}/metrics/
+    logs/(fail)_exp{n}_{阶段}_{模型名}[_{kind}]_{MMDD_HH}/  各步骤日志 + summary.txt
+    阶段 m1：
+        checkpoints/{smoke,full}/(fail)_exp{n}_{MMDD_HH}/{method}/
+        results/m1/{tokenize_stats,bf16_diag,smoke,full}/(fail)_exp{n}_{MMDD_HH}/metrics/
+    阶段 m2/m3（阶段取自配置 experiment 字段第一个下划线前的部分）：
+        checkpoints/smoke/...（全局，每次 smoke 覆盖）；checkpoints/{阶段}/{模型名}/full/...
+        results/{阶段}/{模型名}/{tokenize_stats,bf16_diag,smoke,full}/...（smoke 只清除同一模型下的旧版本）
 
 kind：
     smoke     少量样本训练 + 少量题评测；评测成功后自动删除该方法的 ckpt（失败则保留）；
@@ -88,6 +92,49 @@ def check_learned_format(runner: Runner, eval_json: Path, method: str) -> int:
     return 0 if ok else 1
 
 
+STAGES = ("m1", "m2", "m3")
+
+
+def stage_layout(cfg: dict, kind: str, repo_root: Path) -> tuple[str, str, Path, Path | None]:
+    """按配置的阶段（``experiment`` 第一个下划线前的部分）与模型名决定标签与产物根目录。
+
+    Args:
+        cfg: 含 ``experiment`` 与 ``model.name`` 的配置字典。
+        kind: ``KINDS`` 之一。
+        repo_root: 仓库根目录。
+
+    Returns:
+        ``(阶段, logs 名中的标签, results 根目录, ckpt 根目录或 None)``。
+        m1 保持原布局；其他阶段的 results 放在 ``results/{阶段}/{模型名}/{类别}``，
+        full 的 ckpt 放在 ``checkpoints/{阶段}/{模型名}/full``；
+        smoke 的 ckpt 仍在全局 ``checkpoints/smoke``（每次 smoke 覆盖）。
+
+    Raises:
+        SystemExit: ``experiment`` 存在但阶段不是 m1/m2/m3；缺省该字段时按 m1 处理。
+    """
+    exp_name = cfg.get("experiment")
+    # 配置没有 experiment 字段时沿用 m1 布局（向后兼容）；有但无法识别则报错，不猜。
+    stage = "m1" if exp_name is None else str(exp_name).split("_")[0]
+    if stage not in STAGES:
+        raise SystemExit(f"无法从 experiment={cfg.get('experiment')!r} 判断阶段（应以 m1_/m2_/m3_ 开头）。")
+    model_name = cfg["model"]["name"]
+    tag = f"{stage}_{model_name}" + ("" if kind == "full" else f"_{kind}")
+    sub = RESULT_SUBDIR[kind]
+    if stage == "m1":
+        res_root = repo_root / "results" / "m1" / sub
+        full_ckpt = repo_root / "checkpoints" / "full"
+    else:
+        res_root = repo_root / "results" / stage / model_name / sub
+        full_ckpt = repo_root / "checkpoints" / stage / model_name / "full"
+    if kind == "smoke":
+        ckpt_root: Path | None = repo_root / "checkpoints" / "smoke"
+    elif kind == "full":
+        ckpt_root = full_ckpt
+    else:
+        ckpt_root = None
+    return stage, tag, res_root, ckpt_root
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--kind", required=True, choices=KINDS)
@@ -112,17 +159,14 @@ def main() -> None:
     if len(configs) > 1 and args.kind != "tokenize":
         raise SystemExit("只有 --kind tokenize 支持多个 --config。")
     cfg = load_config(abspath(configs[0]))
-    model_name = cfg["model"]["name"]
-    tag = f"m1_{model_name}" + ("" if args.kind == "full" else f"_{args.kind}")
+    stage, tag, res_root, ckpt_root = stage_layout(cfg, args.kind, REPO_ROOT)
 
     logs_root = REPO_ROOT / "logs"
     n, st, logs_dir = alloc_logs_dir(logs_root, tag)
     runner = Runner(logs_dir)
     runner.note(f"exp{n}  kind={args.kind}  logs={logs_dir.name}")
 
-    res_root = REPO_ROOT / "results" / "m1" / RESULT_SUBDIR[args.kind]
-    has_ckpt = args.kind in ("smoke", "full")
-    ckpt_root = REPO_ROOT / "checkpoints" / args.kind if has_ckpt else None
+    has_ckpt = ckpt_root is not None
     if args.kind == "smoke":
         for root in (res_root, ckpt_root):
             removed = clear_versions(root)
