@@ -10,12 +10,16 @@ model:
   name: Mistral-7B-v0.1
   source: local
   local_path: data/m2/models/models/AI-ModelScope--Mistral-7B-v0.1/snapshots/master
-  # 来源核对（未完成）：ModelScope AI-ModelScope/Mistral-7B-v0.1 只有 pytorch_model-*.bin，没有 safetensors；
-  # 需要对照 Hugging Face 官方 mistralai/Mistral-7B-v0.1 的 .bin sha256
-  # （分片 1：67b1ea77…991f，分片 2：1feecce0…3773e）核对后才能使用，权重核对完成前本配置不可用于正式实验。
-  # 已核对：config.json、generation_config.json 的 git blob id 与官方一致；tokenizer.model 的 sha256 与官方一致。
-  # 已知差异：tokenizer.json、special_tokens_map.json、tokenizer_config.json 的字节数与官方不同，
-  #   是否影响分词结果尚未验证。
+  # 来源核对：权重取自 ModelScope AI-ModelScope/Mistral-7B-v0.1（搬运账号），该仓库只有 pytorch_model-*.bin。
+  # 已核对：两个 .bin 分片的 sha256 与 Hugging Face 官方 mistralai/Mistral-7B-v0.1 一致
+  #   （分片 1：67b1ea77…991f，分片 2：1feecce0…3773e）；config.json、generation_config.json 的 git blob id 一致；
+  #   tokenizer.model 的 sha256 一致。
+  # 使用前须运行 src/scripts/download/convert_bin_to_safetensors.py --model-dir <本目录>：
+  #   transformers 5.x 不再加载 .bin；转换对每个张量校验 dtype、shape、数值与 .bin 完全一致，
+  #   但生成的 safetensors 不是官方文件的逐字节副本。
+  # 已知差异：tokenizer.json、special_tokens_map.json、tokenizer_config.json 的字节数与官方不同；
+  #   取训练集前 2000 条样本，tokenizer.json 与 tokenizer.model（sentencepiece）分词结果逐条一致；
+  #   这三个文件的内容未逐字节比对。
   # tokenizer：pad_token 为空，代码会取 eos 作 pad；填充位置靠 labels=-100 与 attention_mask 屏蔽，不依赖 pad id。
 
 data:
