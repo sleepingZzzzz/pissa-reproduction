@@ -1,0 +1,87 @@
+# M2：Gemma-7B，协议与 M1 论文配置（configs/paper/m1_llama2_7b.yaml）完全相同，只换模型。
+# Gemma-7B 在论文 Table 2 中（GSM8K：Full 72.09、LoRA 75.11/74.53、PiSSA 77.78，3 次运行均值）。
+# 与 M1 一致的项：数据（swift/MetaMathQA 前 100K）、r=128/alpha=128、lr 2e-5、有效 batch 128、
+#   max_seq_len=512、eval max_new_tokens=1024、官方评分规则；精度见 methods。
+# 自包含，不依赖 base.yaml。扩展探索请另建配置，不要改本文件。
+
+experiment: m2_gemma_7b_paper512
+
+model:
+  name: Gemma-7B
+  source: local
+  local_path: data/m2/models/models/AI-ModelScope--gemma-7b/snapshots/master
+  # 来源核对：权重取自 ModelScope AI-ModelScope/gemma-7b（搬运账号）。4 个 safetensors 分片大小与 Hugging Face
+  # 官方 google/gemma-7b 一致；config/generation_config/index/special_tokens_map/tokenizer_config 的 git blob id 一致；
+  # tokenizer.json、tokenizer.model 大小一致。官方为受限仓库，LFS sha256 不可见，因此权重未做哈希核对（未验证）。
+  # 官方仓库另有 34GB 的 gemma-7b.gguf，本地未下载，也不使用。
+
+data:
+  source: modelscope
+  metamath_ms_repo: swift/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 100000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  niter: 16
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  # 有效 batch = per_device_batch * grad_accum = 128（见 methods）。
+
+train:
+  num_epochs: 1
+  max_seq_len: 512
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+  tf32: true
+
+# 精度（同 M1）：LoRA/PiSSA 为 FP32 基座与适配器，Full-FT 为纯 BF16（run_exp.py 需传 --master-weights none）。
+# 偏差：单卡 + 梯度累积凑出有效 batch 128；per_device_batch 沿用 M1 的取值。
+# 风险（未验证）：Gemma 词表 256000，FP32 的 logits 约为 Llama-2 的 8 倍，PiSSA/LoRA 可能 OOM；
+#   Gemma 的输入输出嵌入共享权重，PiSSA/LoRA 的适配器注入与合并对其影响未在本项目验证。
+#   OOM 时按“降 per_device_batch、等比例增大 grad_accum”处理，并在记录中标明。
+methods:
+  pissa:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  lora:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 1024
+  batch_size: 16
+  stop_strings: official_f7509eee
+
+paths:
+  output_dir: results/paper/m2_gemma_7b_len512
+  ckpt_dir: checkpoints/paper/m2_gemma_7b_len512

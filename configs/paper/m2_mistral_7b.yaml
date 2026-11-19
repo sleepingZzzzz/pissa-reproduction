@@ -1,0 +1,87 @@
+# M2：Mistral-7B-v0.1，协议与 M1 论文配置（configs/paper/m1_llama2_7b.yaml）完全相同，只换模型。
+# Mistral-7B-v0.1 在论文 Table 2 中（GSM8K：Full 69.91、LoRA 69.50/69.40、PiSSA 73.31，3 次运行均值）。
+# 与 M1 一致的项：数据（swift/MetaMathQA 前 100K）、r=128/alpha=128、lr 2e-5、有效 batch 128、
+#   max_seq_len=512、eval max_new_tokens=1024、官方评分规则；精度见 methods。
+# 自包含，不依赖 base.yaml。扩展探索请另建配置，不要改本文件。
+
+experiment: m2_mistral_7b_paper512
+
+model:
+  name: Mistral-7B-v0.1
+  source: local
+  local_path: data/m2/models/models/AI-ModelScope--Mistral-7B-v0.1/snapshots/master
+  # 来源核对（未完成）：ModelScope AI-ModelScope/Mistral-7B-v0.1 只有 pytorch_model-*.bin，没有 safetensors；
+  # 需要对照 Hugging Face 官方 mistralai/Mistral-7B-v0.1 的 .bin sha256
+  # （分片 1：67b1ea77…991f，分片 2：1feecce0…3773e）核对后才能使用，权重核对完成前本配置不可用于正式实验。
+  # 已核对：config.json、generation_config.json 的 git blob id 与官方一致；tokenizer.model 的 sha256 与官方一致。
+  # 已知差异：tokenizer.json、special_tokens_map.json、tokenizer_config.json 的字节数与官方不同，
+  #   是否影响分词结果尚未验证。
+  # tokenizer：pad_token 为空，代码会取 eos 作 pad；填充位置靠 labels=-100 与 attention_mask 屏蔽，不依赖 pad id。
+
+data:
+  source: modelscope
+  metamath_ms_repo: swift/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  num_train_samples: 100000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  niter: 16
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  # 有效 batch = per_device_batch * grad_accum = 128（见 methods）。
+
+train:
+  num_epochs: 1
+  max_seq_len: 512
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+  tf32: true
+
+# 精度（同 M1）：LoRA/PiSSA 为 FP32 基座与适配器，Full-FT 为纯 BF16（run_exp.py 需传 --master-weights none）。
+# 偏差：单卡 + 梯度累积凑出有效 batch 128；per_device_batch 沿用 M1 的取值。
+methods:
+  pissa:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  lora:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 1024
+  batch_size: 16
+  stop_strings: official_f7509eee
+
+paths:
+  output_dir: results/paper/m2_mistral_7b_len512
+  ckpt_dir: checkpoints/paper/m2_mistral_7b_len512

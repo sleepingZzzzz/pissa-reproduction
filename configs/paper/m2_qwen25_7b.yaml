@@ -1,0 +1,86 @@
+# M2 拓展：Qwen2.5-7B，协议与 M1 论文配置（configs/paper/m1_llama2_7b.yaml）完全相同，只换模型。
+# 注意：Qwen2.5-7B 不在论文的模型列表中（论文 §5.4 有 Qwen1.5-7B），属于拓展实验，不与论文数值逐项对照。
+# 与 M1 一致的项：数据（swift/MetaMathQA 前 100K）、r=128/alpha=128、lr 2e-5、有效 batch 128、
+#   max_seq_len=512、eval max_new_tokens=1024、官方评分规则；精度见 methods。
+# 自包含，不依赖 base.yaml。扩展探索请另建配置，不要改本文件。
+
+experiment: m2_qwen25_7b_paper512
+
+model:
+  name: Qwen2.5-7B
+  source: local
+  local_path: data/m2/models/Qwen2.5-7B/Qwen/Qwen2___5-7B
+  # 来源核对：本地 4 个 safetensors 分片的 sha256 与 Hugging Face 官方 Qwen/Qwen2.5-7B 一致；
+  # config.json、generation_config.json、tokenizer*.json、vocab.json、merges.txt、index 的 git blob id 也一致。
+  # tokenizer：eos=pad=<|endoftext|>（id 151643），无 BOS；填充位置靠 labels=-100 与 attention_mask 屏蔽，不依赖 pad id。
+
+data:
+  source: modelscope
+  metamath_ms_repo: swift/MetaMathQA
+  metamath_hf_repo: meta-math/MetaMathQA
+  gsm8k_ms_repo: modelscope/gsm8k
+  gsm8k_hf_repo: openai/gsm8k
+  gsm8k_subset: main
+  train_jsonl: data/m1/metamath_train.jsonl
+  gsm8k_jsonl: data/m1/gsm8k_test.jsonl
+  # 与 M1 共用同一份已生成的 jsonl（swift/MetaMathQA 前 100K）。
+  num_train_samples: 100000
+
+adapter:
+  r: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  niter: 16
+
+optim:
+  learning_rate: 2.0e-5
+  weight_decay: 0.0
+  lr_scheduler: cosine
+  warmup_ratio: 0.03
+  # 有效 batch = per_device_batch * grad_accum = 128（见 methods）。
+
+train:
+  num_epochs: 1
+  max_seq_len: 512
+  loss_on_response_only: true
+  seed: 42
+  log_every: 10
+  save_merged_dtype: bfloat16
+  tf32: true
+
+# 精度（同 M1）：LoRA/PiSSA 为 FP32 基座与适配器，Full-FT 为纯 BF16（run_exp.py 需传 --master-weights none）。
+# 偏差：单卡 + 梯度累积凑出有效 batch 128；per_device_batch 沿用 M1 的取值，Qwen 词表更大（152064）
+#   但序列最长 512，logits 显存仍低于 M1 的 1024 评估；未在 Qwen 上实测显存，如 OOM 按“降 per_device_batch、
+#   等比例增大 grad_accum”处理。
+methods:
+  pissa:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  lora:
+    dtype: float32
+    per_device_batch: 8
+    grad_accum: 16
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+  full:
+    dtype: bfloat16
+    per_device_batch: 4
+    grad_accum: 32
+    optimizer: adamw
+    grad_checkpointing: true
+    learning_rate: null
+
+eval:
+  max_new_tokens: 1024
+  batch_size: 16
+  stop_strings: official_f7509eee
+
+paths:
+  output_dir: results/paper/m2_qwen25_7b_len512
+  ckpt_dir: checkpoints/paper/m2_qwen25_7b_len512
