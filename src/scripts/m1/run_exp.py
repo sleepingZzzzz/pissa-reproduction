@@ -15,6 +15,8 @@ kind：
     full      正式训练 + 评测。
     tokenize  只做分词/截断统计（可传多个 --config）。
     bf16diag  BF16 + AdamW 小更新诊断。
+    base      不训练，直接评测原始基座（配置 model.local_path 或 --base-model-dir），无 ckpt；
+              用 --fallback-score 可同时输出“取最后一个数字”的回退评分（辅助指标）。
 
 fail 标识按类别判定：ckpt = 所有训练成功；results = 所有步骤成功；logs = 所有步骤成功。
 全程不碰 git，不关机。
@@ -22,6 +24,7 @@ fail 标识按类别判定：ckpt = 所有训练成功；results = 所有步骤�
 用法示例：
     python src/scripts/m1/run_exp.py --kind smoke --vllm-smoke
     python src/scripts/m1/run_exp.py --kind full --backend vllm
+    python src/scripts/m1/run_exp.py --kind base --config configs/paper/m2_qwen25_7b.yaml --backend vllm --fallback-score
     python src/scripts/m1/run_exp.py --kind tokenize --config configs/paper/m1_llama2_7b.yaml --config configs/paper/m1_llama2_7b_len1024.yaml
 """
 from __future__ import annotations
@@ -40,8 +43,9 @@ import time
 from exp_registry import alloc_logs_dir, category_dir, clear_versions, mark_ok
 from utils import REPO_ROOT, abspath, load_config
 
-KINDS = ("smoke", "full", "tokenize", "bf16diag")
-RESULT_SUBDIR = {"smoke": "smoke", "full": "full", "tokenize": "tokenize_stats", "bf16diag": "bf16_diag"}
+KINDS = ("smoke", "full", "tokenize", "bf16diag", "base")
+RESULT_SUBDIR = {"smoke": "smoke", "full": "full", "tokenize": "tokenize_stats", "bf16diag": "bf16_diag",
+                 "base": "base"}
 TRAIN = "src/scripts/m1/train.py"
 EVAL = "src/scripts/m1/eval_gsm8k.py"
 DIAG = "src/scripts/m1/diag_bf16_update.py"
@@ -153,6 +157,10 @@ def main() -> None:
     p.add_argument("--master-weights", default="cpu_fp32", choices=["none", "cpu_fp32"],
                    help="仅用于 method=full 的 train.py --master-weights")
     p.add_argument("--windows", type=int, default=4, help="bf16diag 的梯度窗口数")
+    p.add_argument("--fallback-score", action="store_true",
+                   help="评测时额外计算回退评分 last_number_v1（辅助指标，不替代主评分）；默认关闭")
+    p.add_argument("--base-model-dir", default=None,
+                   help="仅 --kind base：基座模型目录；缺省取配置 model.local_path")
     args = p.parse_args()
 
     configs = args.config or ["configs/paper/m1_llama2_7b.yaml"]
@@ -183,6 +191,7 @@ def main() -> None:
         paths += ["--set", f"paths.ckpt_dir={ckpt_dir}"]
     cfg_path = configs[0]
     train_ok = True
+    fb = ["--fallback-score"] if args.fallback_score else []
 
     if args.kind == "tokenize":
         for c in configs:
@@ -190,6 +199,20 @@ def main() -> None:
                                                     "--tokenize-only", "--overwrite", *paths])
     elif args.kind == "bf16diag":
         runner.run("bf16_diag", [py, DIAG, "--config", cfg_path, "--windows", str(args.windows), "--overwrite", *paths])
+    elif args.kind == "base":
+        base_dir = args.base_model_dir or cfg["model"].get("local_path")
+        if not base_dir:
+            runner.note("base 评测需要 --base-model-dir 或配置 model.local_path")
+            runner.rcs["base_model_dir"] = 1
+        else:
+            # 基座没有适配器：method=full 只表示“按普通模型加载”，不会注入或合并任何东西。
+            bcmd = [py, EVAL, "--config", cfg_path, "--method", "full", "--ckpt", str(abspath(base_dir)),
+                    "--overwrite", *paths, *fb]
+            if args.backend == "vllm":
+                if runner.run("eval_base", [args.vllm_python, *bcmd[1:], "--backend", "vllm"]) != 0:
+                    runner.run("eval_base_hf", [*bcmd, "--backend", "hf"])
+            else:
+                runner.run("eval_base", [*bcmd, "--backend", "hf"])
     else:
         smoke = args.kind == "smoke"
         for m in args.methods:
@@ -202,7 +225,7 @@ def main() -> None:
                 train_ok = False
                 continue
             mdir = ckpt_dir / m
-            ecmd = [py, EVAL, "--config", cfg_path, "--method", m, "--ckpt", str(mdir), *paths]
+            ecmd = [py, EVAL, "--config", cfg_path, "--method", m, "--ckpt", str(mdir), *paths, *fb]
             if smoke:
                 ecmd += ["--limit", str(args.eval_limit), "--backend", "hf", "--overwrite"]
                 rc = runner.run(f"eval_{m}", ecmd)
@@ -213,7 +236,7 @@ def main() -> None:
                     rc |= runner.run(f"eval_{m}_vllm", [
                         args.vllm_python, EVAL, "--config", cfg_path, "--method", m, "--ckpt", str(mdir),
                         "--limit", str(args.vllm_limit), "--backend", "vllm", "--overwrite",
-                        "--set", f"paths.output_dir={vres}"])
+                        "--set", f"paths.output_dir={vres}", *fb])
                 if rc == 0:
                     shutil.rmtree(mdir)
                     runner.note(f"smoke 评测成功，已删除 ckpt：{mdir}")
@@ -227,6 +250,8 @@ def main() -> None:
 
     # ---- 收尾：按类别去掉 fail 前缀 ----
     ok_all = runner.all_ok
+    if args.kind == "base" and args.backend == "vllm" and "base_model_dir" not in runner.rcs:
+        ok_all = runner.rcs.get("eval_base") == 0 or runner.rcs.get("eval_base_hf") == 0
     if args.kind == "full" and args.backend == "vllm":
         # vLLM 失败但 hf 回退成功时，回退产物完整：以“每个方法最终有一次成功评测”为准。
         final_ok = all(
