@@ -1,8 +1,8 @@
 # M3 Table 4（量化重建误差）参考配置：LLaMA-2-7B，只做初始化阶段的量化误差测量，不训练。
 # 协议（HANDOFF P6/P7）：FP32 计算；NF4、blocksize 64；初始化阶段关闭 double quant；
 # QPiSSA 为外层交替初始化，轮数用命令行 --rounds 指定（1 轮 = 一次 SVD 后量化残差的基线；论文配置 5 轮）。
-#   python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 1
-#   python src/scripts/m3/table4.py --config configs/paper/m3_table4_llama2_7b.yaml --rounds 5
+#   python src/scripts/m1/run_exp.py --kind table4 --config configs/paper/m3_table4_llama2_7b.yaml --rounds 5 1
+#   （按 exp 号保存到 results/m3/{模型名}/table4/；直接运行 src/scripts/m3/table4.py 则写入下方 paths.output_dir，不带 exp 号）
 # 本配置自包含，不依赖 base.yaml。
 
 experiment: m3_table4_llama2_7b

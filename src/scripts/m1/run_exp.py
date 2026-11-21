@@ -17,6 +17,8 @@ kind：
     bf16diag  BF16 + AdamW 小更新诊断。
     base      不训练，直接评测原始基座（配置 model.local_path 或 --base-model-dir），无 ckpt；
               用 --fallback-score 可同时输出“取最后一个数字”的回退评分（辅助指标）。
+    table4    M3 Table 4 量化重建误差（不训练、无 ckpt）：对 --rounds 中的每个轮数串行运行
+              src/scripts/m3/table4.py，结果写入 results/{阶段}/{模型名}/table4/exp{n}_{MMDD_HH}/metrics/。
 
 fail 标识按类别判定：ckpt = 所有训练成功；results = 所有步骤成功；logs = 所有步骤成功。
 全程不碰 git，不关机。
@@ -25,6 +27,7 @@ fail 标识按类别判定：ckpt = 所有训练成功；results = 所有步骤�
     python src/scripts/m1/run_exp.py --kind smoke --vllm-smoke
     python src/scripts/m1/run_exp.py --kind full --backend vllm
     python src/scripts/m1/run_exp.py --kind base --config configs/paper/m2_qwen25_7b.yaml --backend vllm --fallback-score
+    python src/scripts/m1/run_exp.py --kind table4 --config configs/paper/m3_table4_llama3_8b.yaml --rounds 5 1
     python src/scripts/m1/run_exp.py --kind tokenize --config configs/paper/m1_llama2_7b.yaml --config configs/paper/m1_llama2_7b_len1024.yaml
 """
 from __future__ import annotations
@@ -43,12 +46,13 @@ import time
 from exp_registry import alloc_logs_dir, category_dir, clear_versions, mark_ok
 from utils import REPO_ROOT, abspath, load_config
 
-KINDS = ("smoke", "full", "tokenize", "bf16diag", "base")
+KINDS = ("smoke", "full", "tokenize", "bf16diag", "base", "table4")
 RESULT_SUBDIR = {"smoke": "smoke", "full": "full", "tokenize": "tokenize_stats", "bf16diag": "bf16_diag",
-                 "base": "base"}
+                 "base": "base", "table4": "table4"}
 TRAIN = "src/scripts/m1/train.py"
 EVAL = "src/scripts/m1/eval_gsm8k.py"
 DIAG = "src/scripts/m1/diag_bf16_update.py"
+TABLE4 = "src/scripts/m3/table4.py"
 
 
 class Runner:
@@ -159,6 +163,8 @@ def main() -> None:
     p.add_argument("--windows", type=int, default=4, help="bf16diag 的梯度窗口数")
     p.add_argument("--fallback-score", action="store_true",
                    help="评测时额外计算回退评分 last_number_v1（辅助指标，不替代主评分）；默认关闭")
+    p.add_argument("--rounds", type=int, nargs="+", default=[5, 1],
+                   help="仅 --kind table4：QPiSSA 外层交替轮数，按给定顺序串行运行（默认 5 1）")
     p.add_argument("--base-model-dir", default=None,
                    help="仅 --kind base：基座模型目录；缺省取配置 model.local_path")
     args = p.parse_args()
@@ -199,6 +205,10 @@ def main() -> None:
                                                     "--tokenize-only", "--overwrite", *paths])
     elif args.kind == "bf16diag":
         runner.run("bf16_diag", [py, DIAG, "--config", cfg_path, "--windows", str(args.windows), "--overwrite", *paths])
+    elif args.kind == "table4":
+        for r in args.rounds:
+            runner.run(f"table4_rounds{r}", [py, TABLE4, "--config", cfg_path, "--rounds", str(r),
+                                             "--set", f"paths.output_dir={res_dir / 'metrics'}"])
     elif args.kind == "base":
         base_dir = args.base_model_dir or cfg["model"].get("local_path")
         if not base_dir:
