@@ -202,6 +202,9 @@ def main() -> None:
     parser.add_argument("--backend", default="hf", choices=["hf", "vllm"])
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已有评测产物")
+    parser.add_argument("--fallback-score", action="store_true",
+                        help="额外计算回退评分 last_number_v1（取全文最后一个数字），写入 fallback_secondary；"
+                             "辅助指标，不替代主评分；默认关闭，关闭时输出与以前完全一致")
     args = parser.parse_args()
 
     # ---- 配置：显式 --config，或 checkpoint 快照 ----
@@ -310,7 +313,7 @@ def main() -> None:
 
     # ---- 评分与归档（逐题档案与指标分开）----
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    n_pred = n_correct = n_correct_sec = n_budget = n_eos = 0
+    n_pred = n_correct = n_correct_sec = n_correct_fb = n_budget = n_eos = 0
     with open(gen_path, "w", encoding="utf-8") as f:
         for it, prompt, rec in zip(items, prompts, records):
             ok, pred = gs.score_primary(rec["output"], it["gold"])
@@ -320,13 +323,18 @@ def main() -> None:
             n_correct_sec += int(ok2)
             n_budget += int(rec["hit_budget"])
             n_eos += int(rec["has_eos"])
-            f.write(json.dumps({
+            row = {
                 "idx": it["idx"], "question": it["question"], "prompt": prompt, "answer": it["answer"],
                 "gold": it["gold"], "output": rec["output"], "pred": pred, "correct": ok,
                 "decimal_candidate": cand, "decimal_correct": ok2,
                 "new_tokens": rec["new_tokens"], "hit_budget": rec["hit_budget"],
                 "has_eos": rec["has_eos"], "stop_string": rec["stop_string"],
-            }, ensure_ascii=False) + "\n")
+            }
+            if args.fallback_score:
+                ok3, fb_cand = gs.score_fallback(rec["output"], it["gold"])
+                n_correct_fb += int(ok3)
+                row["fallback_candidate"], row["fallback_correct"] = fb_cand, ok3
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     n_gold = len(items)
     primary = compute_metrics(n_raw, n_gold, n_pred, n_correct)
@@ -349,6 +357,7 @@ def main() -> None:
             "scorer_primary": gs.SCORER_PRIMARY,
             "scorer_secondary": gs.SCORER_SECONDARY,
             "generations_file": str(gen_path),
+            **({"scorer_fallback": gs.SCORER_FALLBACK} if args.fallback_score else {}),
         },
         "results": {
             "accuracy": primary["accuracy"],
@@ -357,6 +366,8 @@ def main() -> None:
             **primary,
             "decimal_secondary": {"scorer": gs.SCORER_SECONDARY, "N_correct": n_correct_sec,
                                   "accuracy": n_correct_sec / n_gold},
+            **({"fallback_secondary": {"scorer": gs.SCORER_FALLBACK, "N_correct": n_correct_fb,
+                                       "accuracy": n_correct_fb / n_gold}} if args.fallback_score else {}),
             "invalid_gold_count": len(invalid_gold),
             "invalid_gold_examples": invalid_gold[:50],
             "hit_budget_count": n_budget,

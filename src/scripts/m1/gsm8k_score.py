@@ -20,6 +20,7 @@ from fractions import Fraction
 
 SCORER_PRIMARY = "official_f7509eee_v1"
 SCORER_SECONDARY = "decimal_v1"
+SCORER_FALLBACK = "last_number_v1"
 ANSWER_MARKER = "The answer is: "
 # 官方评测参考 f7509eee 的停止串；官方 main 的 gen_vllm.py 为空列表（变体）。
 OFFICIAL_STOP_STRINGS_F7509EEE = [
@@ -121,6 +122,33 @@ def score_secondary(completion: str, gold_text: str) -> tuple[bool, str | None]:
             value = Fraction(Decimal(c))
         return value == gold, c
     except (InvalidOperation, ValueError, ZeroDivisionError):
+        return False, cand
+
+
+def score_fallback(completion: str, gold: float) -> tuple[bool, str | None]:
+    """回退评分 last_number_v1：取全文最后一个数字候选，不要求 ``The answer is: ``，不取整。
+
+    仅用于估计没有学会答案格式的模型（如原始基座）的数学能力，是辅助指标，不替代主评分。
+    候选沿用主评分的数字正则；千位逗号去掉；``a/b`` 形式按分数求值（分母为 0 视为不正确）。
+
+    Returns:
+        (是否正确, 最后一个候选的原始字符串或 None)。
+    """
+    matches = _NUMBER.findall(completion)
+    if not matches:
+        return False, None
+    cand = matches[-1]
+    try:
+        c = cand.replace(",", "")
+        if "/" in c:
+            num, den = c.split("/")[0], c.split("/")[1]
+            if not (is_number(num) and is_number(den)) or float(den) == 0:
+                return False, cand
+            value = float(num) / float(den)
+        else:
+            value = float(c)
+        return value == float(gold), cand
+    except (ValueError, OverflowError, ZeroDivisionError):
         return False, cand
 
 
